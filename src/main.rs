@@ -1,28 +1,38 @@
 //! toss: send files to your own devices and friends, peer to peer.
 //! Devices are known by public key (iroh), never by IP address.
 
+mod gui;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     io::{IsTerminal as _, Write as _},
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use iroh::{
     Endpoint, EndpointId, SecretKey, Signature,
-    endpoint::{Connection, Incoming, PortmapperConfig, presets},
+    endpoint::{Connection, Incoming, PortmapperConfig, VarInt, WeakConnectionHandle, presets},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
-const ALPN: &[u8] = b"toss/1";
+// v2 adds resuming; the version is in the protocol name so mismatched builds fail cleanly.
+const ALPN: &[u8] = b"toss/2";
 const INVITE_ALPN: &[u8] = b"toss/invite/1";
 const DIALER: &[u8] = b"dialer";
 const ACCEPTOR: &[u8] = b"acceptor";
 const MAX_MSG: usize = 16 << 20;
+// The receiver's first reply to an offer.
+const DECLINED: u8 = 0;
+const ACCEPTED: u8 = 1;
+const NO_SPACE: u8 = 2;
 
 const USAGE: &str = "usage:
+  toss                        open the window
   toss invite <name>          print an invite link (<name> is what you'll call them)
   toss join <link> <name>     accept an invite link (<name> is what you'll call them)
   toss contacts               list contacts
@@ -35,12 +45,13 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let res = match args.as_slice() {
-        ["invite", name] => invite(name).await,
-        ["join", link, name] => join(link, name).await,
+        [] => gui::run(),
+        ["invite", name] => cli_invite(name).await,
+        ["join", link, name] => join(link, name).await.map(|()| println!("Paired with {name}.")),
         ["contacts"] => list(),
-        ["forget", name] => forget(name),
-        ["send", name, paths @ ..] if !paths.is_empty() => send(name, paths).await,
-        ["listen"] => listen().await,
+        ["forget", name] => forget(name).map(|()| println!("Forgot {name}.")),
+        ["send", name, paths @ ..] if !paths.is_empty() => send(name, paths, &Cli).await,
+        ["listen"] => listen(Arc::new(Cli)).await,
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2)
@@ -49,6 +60,85 @@ async fn main() {
     if let Err(e) = res {
         eprintln!("error: {e:#}");
         std::process::exit(1)
+    }
+}
+
+enum Answer {
+    No,
+    Yes,
+    Always,
+}
+
+/// What the core reports while it works. The terminal prints it; the window shows it.
+enum Event<'a> {
+    Ready(&'a Path),
+    Waiting { to: &'a str, files: usize },
+    Sent { to: &'a str, files: usize, direct: bool, mb_per_s: Option<f64>, resumed: u64 },
+    Receiving { from: &'a str, files: usize },
+    Checking { bytes: u64 }, // hashing what an earlier try left before continuing; minutes on a slow disk
+    Received { from: &'a str, files: usize, resumed: u64 },
+    Declined { from: &'a str },
+    Failed(String),
+}
+
+/// What differs between the terminal and the window: how events and progress show, and how we ask.
+trait Ui: Sync {
+    fn event(&self, event: Event);
+    fn progress(&self, done: u64, total: u64);
+    fn accept(&self, from: &str, files: &[(String, u64)]) -> impl Future<Output = Answer> + Send;
+}
+
+struct Cli;
+
+impl Ui for Cli {
+    fn event(&self, event: Event) {
+        match event {
+            Event::Ready(dir) => println!("Ready to receive. Files go to {}.", dir.display()),
+            Event::Waiting { to, .. } => println!("Waiting for {to} to accept..."),
+            Event::Sent { to, files, direct, mb_per_s, resumed } => {
+                let mut notes = vec![if direct { "direct" } else { "via relay" }.to_string()];
+                notes.extend(mb_per_s.map(|s| format!("{s:.1} MB/s")));
+                notes.extend(continued(resumed));
+                println!("Sent {} to {to} ({}).", count(files), notes.join(", "));
+            }
+            Event::Receiving { from, files } => println!("Receiving {} from {from}...", count(files)),
+            Event::Checking { bytes } => println!("Checking {} from an earlier try...", human(bytes)),
+            Event::Received { from, files, resumed } => match continued(resumed) {
+                Some(note) => println!("Received {} from {from} ({note}).", count(files)),
+                None => println!("Received {} from {from}.", count(files)),
+            },
+            Event::Declined { from } => println!("Declined {from}'s files."),
+            Event::Failed(why) => println!("Transfer failed: {why}"),
+        }
+    }
+
+    fn progress(&self, done: u64, total: u64) {
+        if !std::io::stdout().is_terminal() {
+            return; // no live progress in logs (systemd)
+        }
+        print!("\r  {} / {}   ", human(done), human(total));
+        if done == total {
+            println!();
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    fn accept(&self, from: &str, files: &[(String, u64)]) -> impl Future<Output = Answer> + Send {
+        let total: u64 = files.iter().map(|f| f.1).sum();
+        println!("\n{from} wants to send {}, {}:", count(files.len()), human(total));
+        for (name, size) in files.iter().take(10) {
+            println!("  {name} ({})", human(*size));
+        }
+        if files.len() > 10 {
+            println!("  ...and {} more", files.len() - 10);
+        }
+        async {
+            match ask("Accept? [y]es / [n]o / [a]lways from this contact: ").await.as_deref() {
+                Ok("y" | "yes") => Answer::Yes,
+                Ok("a" | "always") => Answer::Always,
+                _ => Answer::No,
+            }
+        }
     }
 }
 
@@ -72,7 +162,17 @@ struct Hello {
     files: Vec<(String, u64)>, // '/'-separated relative path, size in bytes
 }
 
-async fn invite(name: &str) -> Result<()> {
+async fn cli_invite(name: &str) -> Result<()> {
+    let (link, joined) = invite(name).await?;
+    println!("Send this to {name}. It works once, while this command runs:\n\n  toss join {link} <name for you>\n");
+    println!("Waiting for {name} to join...");
+    joined.await?;
+    println!("Paired with {name}.");
+    Ok(())
+}
+
+/// Returns the link to share, and a future that finishes once they've joined.
+async fn invite(name: &str) -> Result<(String, impl Future<Output = Result<()>> + Send + 'static)> {
     let home = home()?;
     let me = load_key(&home)?;
     ensure!(!load_contacts(&home)?.contains_key(name), "you already have a contact called {name}");
@@ -82,23 +182,24 @@ async fn invite(name: &str) -> Result<()> {
         .await
         .context("can't reach the internet, so nobody could join")?;
     let secret = SecretKey::generate().to_bytes()[..16].to_vec(); // 16 bytes from the OS random generator
-    println!("Send this to {name}. It works once, while this command runs:\n");
-    println!("  toss join toss:{}/{} <name for you>\n", ep.id(), hex(&secret));
-    println!("Waiting for {name} to join...");
-    while let Some(incoming) = ep.accept().await {
-        // Relays and the lookup server see the throwaway id, so only the secret proves it's really them.
-        match tokio::time::timeout(Duration::from_secs(30), accept_join(incoming, &me, &secret)).await {
-            Ok(Ok(peer)) => {
-                add_contact(&home, name, peer)?;
-                println!("Paired with {name}.");
-                break;
+    let link = format!("toss:{}/{}", ep.id(), hex(&secret));
+    let name = name.to_string();
+    let joined = async move {
+        while let Some(incoming) = ep.accept().await {
+            // Relays and the lookup server see the throwaway id, so only the secret proves it's really them.
+            match tokio::time::timeout(Duration::from_secs(30), accept_join(incoming, &me, &secret)).await {
+                Ok(Ok(peer)) => {
+                    add_contact(&home, &name, peer)?;
+                    ep.close().await;
+                    return Ok(());
+                }
+                Ok(Err(e)) => eprintln!("Rejected a join attempt: {e:#}"),
+                Err(_) => eprintln!("Rejected a join attempt: timed out"),
             }
-            Ok(Err(e)) => eprintln!("Rejected a join attempt: {e:#}"),
-            Err(_) => eprintln!("Rejected a join attempt: timed out"),
         }
-    }
-    ep.close().await;
-    Ok(())
+        bail!("stopped before anyone joined")
+    };
+    Ok((link, joined))
 }
 
 async fn accept_join(incoming: Incoming, me: &SecretKey, secret: &[u8]) -> Result<EndpointId> {
@@ -127,7 +228,6 @@ async fn join(link: &str, name: &str) -> Result<()> {
     send_msg(&mut tx, &Hello { secret, ..introduce(&conn, &me, DIALER)? }).await?;
     let peer = verify(&conn, &recv_msg(&mut rx).await?, ACCEPTOR)?;
     add_contact(&home, name, peer)?;
-    println!("Paired with {name}.");
     ep.close().await;
     Ok(())
 }
@@ -147,12 +247,10 @@ fn forget(name: &str) -> Result<()> {
     update_contacts(&home()?, |c| {
         ensure!(c.remove(name).is_some(), "no contact called {name}");
         Ok(())
-    })?;
-    println!("Forgot {name}.");
-    Ok(())
+    })
 }
 
-async fn send(name: &str, paths: &[&str]) -> Result<()> {
+async fn send(name: &str, paths: &[impl AsRef<Path>], ui: &impl Ui) -> Result<()> {
     let home = home()?;
     let me = load_key(&home)?;
     let peer: EndpointId = load_contacts(&home)?
@@ -162,7 +260,7 @@ async fn send(name: &str, paths: &[&str]) -> Result<()> {
         .parse()?;
     let mut files = Vec::new(); // (relative path, local path, size)
     let mut tops = HashSet::new();
-    for p in paths.iter().map(Path::new) {
+    for p in paths.iter().map(|p| p.as_ref()) {
         let top = p.file_name().and_then(|n| n.to_str()).with_context(|| format!("can't send {}", p.display()))?;
         ensure!(tops.insert(top.to_lowercase()), "two of the items are called {top}; rename one");
         let meta = std::fs::metadata(p).with_context(|| format!("can't read {}", p.display()))?;
@@ -184,28 +282,56 @@ async fn send(name: &str, paths: &[&str]) -> Result<()> {
     let (mut tx, mut rx) = conn.open_bi().await?;
     let files_msg = files.iter().map(|(rel, _, size)| (rel.clone(), *size)).collect();
     send_msg(&mut tx, &Hello { files: files_msg, ..introduce(&conn, &me, DIALER)? }).await?;
-    println!("Waiting for {name} to accept...");
-    if !matches!(rx.read_u8().await, Ok(1)) {
-        bail!("{name} declined (or doesn't have you as a contact)");
+    ui.event(Event::Waiting { to: name, files: files.len() });
+    match rx.read_u8().await {
+        Ok(ACCEPTED) => {}
+        Ok(NO_SPACE) => bail!("{name} doesn't have enough free disk space"),
+        _ => bail!("{name} declined (or doesn't have you as a contact)"),
     }
-    let mut progress = Progress::new(total);
+    // They say how much of each file they already have, with a hash of it. Continue from there only
+    // where our copy starts with exactly those bytes; anything else starts over.
+    let proofs: Vec<(u64, String)> = recv_msg(&mut rx).await?;
+    ensure!(proofs.len() == files.len(), "{name} sent a bad resume list");
+    let had: u64 = proofs.iter().map(|(have, _)| have).sum();
+    if had > 0 {
+        ui.event(Event::Checking { bytes: had });
+    }
+    let local: Vec<(PathBuf, u64)> = files.iter().map(|(_, path, size)| (path.clone(), *size)).collect();
+    let starts = tokio::task::spawn_blocking(move || -> Result<Vec<u64>> {
+        local
+            .iter()
+            .zip(proofs)
+            .map(|((path, size), (have, hash))| {
+                let same = have > 0 && have <= *size && prefix_hash(path, have)?.to_hex().as_str() == hash;
+                Ok(if same { have } else { 0 })
+            })
+            .collect()
+    })
+    .await??;
+    send_msg(&mut tx, &starts).await?;
+    let resumed: u64 = starts.iter().sum();
+    let mut progress = Progress::new(ui, total);
+    progress.done = resumed;
     let started = Instant::now();
-    for (_, path, size) in &files {
-        let file = tokio::fs::File::open(path).await?;
-        copy_exact(file, &mut tx, *size, &mut progress)
+    for ((_, path, size), start) in files.iter().zip(&starts) {
+        if start == size {
+            continue; // they have all of it
+        }
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(std::io::SeekFrom::Start(*start)).await?;
+        copy_exact(file, &mut tx, size - start, &mut progress)
             .await
             .with_context(|| format!("sending {}", path.display()))?;
     }
     tx.finish()?;
     ensure!(matches!(rx.read_u8().await, Ok(1)), "{name} didn't confirm the files arrived");
     progress.finish();
-    let route = if conn.paths().iter().any(|p| p.is_selected() && p.is_ip()) { "direct" } else { "via relay" };
-    let speed = match mb(total) / started.elapsed().as_secs_f64() {
-        s if total >= 1_000_000 => format!(", {s:.1} MB/s"),
-        _ => String::new(), // too small to time meaningfully
-    };
-    println!("Sent {} file(s) to {name} ({route}{speed}).", files.len());
+    let direct = conn.paths().iter().any(|p| p.is_selected() && p.is_ip());
+    // Under 1 MB the time is mostly setup, so a speed would mislead.
+    let moved = total - resumed;
+    let mb_per_s = (moved >= 1_000_000).then(|| mb(moved) / started.elapsed().as_secs_f64());
     ep.close().await;
+    ui.event(Event::Sent { to: name, files: files.len(), direct, mb_per_s, resumed });
     Ok(())
 }
 
@@ -225,25 +351,41 @@ fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf, u64)>) -> Result<
     Ok(())
 }
 
-async fn listen() -> Result<()> {
+async fn listen<U: Ui + Send + 'static>(ui: Arc<U>) -> Result<()> {
     let home = home()?;
     let me = load_key(&home)?;
-    let downloads = dirs::download_dir().or_else(dirs::home_dir).context("no downloads folder")?;
-    // Two listeners with one key fight over it: the newest silently gets every transfer.
-    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("listen.lock"))?;
-    ensure!(lock.try_lock().is_ok(), "toss listen is already running on this device");
+    let downloads = downloads_dir()?;
+    let _lock = lock_listener(&home)?;
     let ep = bind(me, &[ALPN]).await?;
-    println!("Listening. Files go to {}. Ctrl+C to stop.", downloads.display());
+    ui.event(Event::Ready(&downloads));
+    let turns = Arc::new(Turns::default());
     while let Some(incoming) = ep.accept().await {
-        // shortcut: one transfer at a time so accept prompts don't interleave; fine until there's a GUI.
-        if let Err(e) = receive(incoming, &home, &downloads).await {
-            eprintln!("Transfer failed: {e:#}");
-        }
+        let (ui, turns, home, downloads) = (ui.clone(), turns.clone(), home.clone(), downloads.clone());
+        // Each transfer runs on its own: a vanished sender takes 30 s to time out and mustn't block others.
+        tokio::spawn(async move {
+            if let Err(e) = receive(incoming, &home, &downloads, &*ui, &turns).await {
+                ui.event(Event::Failed(format!("{e:#}")));
+            }
+        });
     }
     Ok(())
 }
 
-async fn receive(incoming: Incoming, home: &Path, downloads: &Path) -> Result<()> {
+/// Keeps transfers that run at the same time apart.
+#[derive(Default)]
+struct Turns {
+    ask: tokio::sync::Mutex<()>,                                      // one accept question at a time
+    staging: std::sync::Mutex<HashMap<PathBuf, (Arc<tokio::sync::Mutex<()>>, Option<WeakConnectionHandle>)>>, // one writer per staging folder
+}
+
+/// Two listeners with one key fight over it: the newest silently gets every transfer. Held until dropped.
+fn lock_listener(home: &Path) -> Result<std::fs::File> {
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(home.join("listen.lock"))?;
+    ensure!(lock.try_lock().is_ok(), "toss is already receiving on this device");
+    Ok(lock)
+}
+
+async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui, turns: &Turns) -> Result<()> {
     let conn = incoming.await?;
     // Anyone who learns our id can connect, so a silent connection must not block the queue.
     let (mut tx, mut rx, offer) = tokio::time::timeout(Duration::from_secs(30), async {
@@ -260,89 +402,211 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path) -> Result<()
         .find(|(_, c)| c.id == from)
         .map(|(n, _)| n.clone())
         .context("ignored a transfer from a device that isn't a contact")?;
-    let dests = plan(&offer.files, downloads, |p| p.exists())?;
+    let paths = sanitize(&offer.files)?;
+    // Files collect in a folder of their own and move into Downloads only once all have arrived.
+    let staging = staging_dir(downloads, &from, &offer.files);
+    // A resend of the same files means the earlier try is dead or unwanted: end it now rather than
+    // waiting out its 30 s timeout, then continue from what it left.
+    let writer = {
+        let mut map = turns.staging.lock().expect("not poisoned");
+        let (writer, latest) = map.entry(staging.clone()).or_default();
+        if let Some(earlier) = latest.replace(conn.weak_handle()).and_then(|earlier| earlier.upgrade()) {
+            earlier.close(VarInt::from_u32(0), b"replaced by a newer try");
+        }
+        writer.clone()
+    };
+    let _writing = writer.lock_owned().await;
+    let staged: Vec<PathBuf> = paths.iter().map(|segs| staging.join(segs.iter().collect::<PathBuf>())).collect();
+    let have: Vec<u64> = staged.iter().zip(&offer.files).map(|(path, (_, size))| already_have(path, *size)).collect();
+    let total = offer.files.iter().try_fold(0u64, |sum, f| sum.checked_add(f.1)).context("file sizes in the offer don't add up")?;
+    let needed = total - have.iter().sum::<u64>();
+    if let Some(free) = free_space(downloads).filter(|free| *free < needed) {
+        tx.write_u8(NO_SPACE).await?;
+        bail!("not enough disk space for {name}'s files: {} needed, {} free", human(needed), human(free));
+    }
 
-    let total = offer.files.iter().map(|f| f.1).sum();
-    println!("\n{name} wants to send {} file(s), {:.1} MB:", offer.files.len(), mb(total));
-    // Show the cleaned names that will be saved, never the raw ones: they could hide terminal control codes.
-    for (dest, (_, size)) in dests.iter().zip(&offer.files).take(10) {
-        println!("  {} ({:.1} MB)", dest.strip_prefix(downloads).unwrap_or(dest).display(), mb(*size));
-    }
-    if offer.files.len() > 10 {
-        println!("  ...and {} more", offer.files.len() - 10);
-    }
-    let accepted = contacts[&name].auto_accept
-        || match ask("Accept? [y]es / [n]o / [a]lways from this contact: ").await?.as_str() {
-            "y" | "yes" => true,
-            "a" | "always" => {
-                update_contacts(home, |c| {
-                    if let Some(c) = c.get_mut(&name) {
-                        c.auto_accept = true; // not if they were forgotten while we waited
-                    }
-                    Ok(())
-                })?;
-                true
+    // Show the cleaned names, never the raw ones: they could hide terminal control codes.
+    let shown: Vec<(String, u64)> = paths.iter().zip(&offer.files).map(|(segs, (_, size))| (segs.join("/"), *size)).collect();
+    let answer = if contacts[&name].auto_accept {
+        ui.event(Event::Receiving { from: &name, files: shown.len() });
+        Answer::Yes
+    } else {
+        let _asking = turns.ask.lock().await;
+        ui.accept(&name, &shown).await
+    };
+    if let Answer::Always = answer {
+        update_contacts(home, |c| {
+            if let Some(c) = c.get_mut(&name) {
+                c.auto_accept = true; // not if they were forgotten while we waited
             }
-            _ => false,
-        };
-    tx.write_u8(accepted as u8).await?;
-    if !accepted {
-        println!("Declined.");
+            Ok(())
+        })?;
+    }
+    if let Answer::No = answer {
+        tx.write_u8(DECLINED).await?;
+        ui.event(Event::Declined { from: &name });
         return Ok(());
     }
-    let mut progress = Progress::new(total);
-    for ((_, size), dest) in offer.files.iter().zip(&dests) {
-        receive_file(&mut rx, dest, *size, &mut progress).await?;
+    tx.write_u8(ACCEPTED).await?;
+    let had: u64 = have.iter().sum();
+    if had > 0 {
+        ui.event(Event::Checking { bytes: had });
     }
+    // Prove what an earlier try left here, so the sender can send only the rest.
+    let proofs = tokio::task::spawn_blocking({
+        let (staged, have) = (staged.clone(), have.clone());
+        move || -> Result<Vec<(u64, String)>> { staged.iter().zip(have).map(|(path, n)| Ok((n, proof(path, n)?))).collect() }
+    })
+    .await??;
+    send_msg(&mut tx, &proofs).await?;
+    let starts: Vec<u64> = recv_msg(&mut rx).await?;
+    // Only "from the start" or "from what we have" is valid; anything else would leave holes in files.
+    ensure!(
+        starts.len() == have.len() && starts.iter().zip(&have).all(|(start, have)| *start == 0 || start == have),
+        "{name} sent a bad resume plan"
+    );
+    let resumed: u64 = starts.iter().sum();
+    let mut progress = Progress::new(ui, total);
+    progress.done = resumed;
+    for ((path, (_, size)), start) in staged.iter().zip(&offer.files).zip(&starts) {
+        receive_file(&mut rx, path, *start, *size, &mut progress).await?;
+    }
+    for (top, name) in free_tops(&paths, downloads, |p| p.exists()) {
+        tokio::fs::rename(staging.join(top), downloads.join(name)).await?;
+    }
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    let _ = tokio::fs::remove_dir(staging.parent().expect("staging is inside .toss-incoming")).await; // only if empty
     tx.write_u8(1).await?;
     tx.finish()?;
     progress.finish();
-    println!("Received {} file(s) from {name}.", offer.files.len());
+    ui.event(Event::Received { from: &name, files: offer.files.len(), resumed });
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await; // let the confirmation arrive
     Ok(())
 }
 
-async fn receive_file(rx: &mut (impl AsyncRead + Unpin), dest: &Path, size: u64, p: &mut Progress) -> Result<()> {
-    if let Some(dir) = dest.parent() {
+/// Writes one file into the staging folder, continuing at `start`. Until it's complete it keeps a
+/// `.toss-part` name, so it never looks finished and is kept for the next try if the transfer breaks.
+async fn receive_file(
+    rx: &mut (impl AsyncRead + Unpin),
+    staged: &Path,
+    start: u64,
+    size: u64,
+    p: &mut Progress<'_, impl Ui>,
+) -> Result<()> {
+    if start == size && tokio::fs::try_exists(staged).await? {
+        return Ok(()); // finished on an earlier try, and the sender confirmed it's the same
+    }
+    if let Some(dir) = staged.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
-    // Write under a temporary name so a failed transfer never looks like a finished file.
-    let name = dest.file_name().expect("checked by plan").to_string_lossy();
-    let part = dest.with_file_name(format!("{name}.toss-part"));
-    let res = async {
-        let mut file = tokio::fs::File::create(&part).await?;
-        copy_exact(&mut *rx, &mut file, size, p).await?;
-        file.flush().await?;
-        drop(file); // Windows can't rename an open file
-        tokio::fs::rename(&part, dest).await?;
-        anyhow::Ok(())
-    }
-    .await;
-    if res.is_err() {
-        let _ = tokio::fs::remove_file(&part).await;
-    }
-    res
+    let _ = tokio::fs::remove_file(staged).await; // an older finished copy that no longer matches
+    let part = part_of(staged);
+    let mut file = tokio::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&part).await?;
+    file.set_len(start).await?; // drop anything past what the sender confirmed
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    copy_exact(&mut *rx, &mut file, size - start, p).await?;
+    file.flush().await?;
+    drop(file); // Windows can't rename an open file
+    tokio::fs::rename(&part, staged).await?;
+    Ok(())
 }
 
-/// Turn the sender's paths into destinations inside `downloads`.
-/// Each top-level file or folder gets a name that's free, so nothing existing is ever overwritten.
-fn plan(files: &[(String, u64)], downloads: &Path, exists: impl Fn(&Path) -> bool) -> Result<Vec<PathBuf>> {
-    let (mut seen, mut used, mut tops) = (HashSet::new(), HashSet::new(), HashMap::new());
-    let mut out = Vec::new();
-    for (rel, _) in files {
-        let segs = rel.split('/').map(safe_name).collect::<Result<Vec<_>>>()?;
-        ensure!(seen.insert(segs.join("/").to_lowercase()), "duplicate path in offer: {rel}");
-        let top = &segs[0];
-        if !tops.contains_key(top) {
-            let name = free_name(top, |n| exists(&downloads.join(n)) || used.contains(&n.to_lowercase()));
-            used.insert(name.to_lowercase());
-            tops.insert(top.clone(), name);
-        }
-        let mut dest = downloads.join(&tops[top]);
-        dest.extend(&segs[1..]);
-        out.push(dest);
+/// Where an incoming transfer collects until it's complete: one folder per sender and file list, so
+/// sending the same files again continues there and different transfers never mix.
+// shortcut: abandoned transfers stay in Downloads/.toss-incoming until deleted by hand; add an
+// age-based cleanup if they pile up.
+fn staging_dir(downloads: &Path, from: &str, files: &[(String, u64)]) -> PathBuf {
+    let mut files: Vec<_> = files.iter().collect();
+    files.sort(); // picking the same files in another order is still the same transfer
+    let mut key = blake3::Hasher::new();
+    key.update(from.as_bytes());
+    for (rel, size) in files {
+        key.update(rel.as_bytes());
+        key.update(&[0]);
+        key.update(&size.to_le_bytes());
     }
-    Ok(out)
+    downloads.join(".toss-incoming").join(&key.finalize().to_hex()[..16])
+}
+
+fn part_of(staged: &Path) -> PathBuf {
+    let mut part = staged.as_os_str().to_owned();
+    part.push(".toss-part");
+    part.into()
+}
+
+/// Bytes of a file an earlier try left: the whole finished copy, or the unfinished part.
+fn already_have(staged: &Path, size: u64) -> u64 {
+    let len = |path: &Path| std::fs::metadata(path).map(|m| m.len()).ok();
+    match len(staged) {
+        Some(n) if n == size => n,
+        _ => len(&part_of(staged)).unwrap_or(0).min(size),
+    }
+}
+
+/// Hash of the first `have` bytes we hold for a file ("" when we hold none).
+fn proof(staged: &Path, have: u64) -> Result<String> {
+    if have == 0 {
+        return Ok(String::new());
+    }
+    let finished = std::fs::metadata(staged).is_ok_and(|m| m.len() == have);
+    Ok(prefix_hash(&if finished { staged.to_path_buf() } else { part_of(staged) }, have)?.to_hex().to_string())
+}
+
+/// BLAKE3 of a file's first `len` bytes: lets two devices agree a partial copy is the real thing.
+fn prefix_hash(path: &Path, len: u64) -> Result<blake3::Hash> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::io::Read::take(std::fs::File::open(path)?, len))?;
+    Ok(hasher.finalize())
+}
+
+/// The sender's paths as plain, safe names. Refuses duplicates and anything that could escape.
+fn sanitize(files: &[(String, u64)]) -> Result<Vec<Vec<String>>> {
+    let mut seen = HashSet::new();
+    files
+        .iter()
+        .map(|(rel, _)| {
+            let segs = rel.split('/').map(safe_name).collect::<Result<Vec<_>>>()?;
+            ensure!(seen.insert(segs.join("/").to_lowercase()), "duplicate path in offer: {rel}");
+            Ok(segs)
+        })
+        .collect()
+}
+
+/// A free name in `dir` for each distinct top-level file or folder, so nothing existing is overwritten.
+fn free_tops<'a>(paths: &'a [Vec<String>], dir: &Path, exists: impl Fn(&Path) -> bool) -> Vec<(&'a str, String)> {
+    let mut used = HashSet::new();
+    let mut out: Vec<(&str, String)> = Vec::new();
+    for top in paths.iter().map(|segs| segs[0].as_str()) {
+        if out.iter().any(|(seen, _)| *seen == top) {
+            continue;
+        }
+        let name = free_name(top, |n| exists(&dir.join(n)) || used.contains(&n.to_lowercase()));
+        used.insert(name.to_lowercase());
+        out.push((top, name));
+    }
+    out
+}
+
+/// Bytes the current user may still write on the disk holding `dir`, if the OS tells us.
+#[cfg(windows)]
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(dir: *const u16, free_to_caller: *mut u64, total: *mut u64, total_free: *mut u64) -> i32;
+    }
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let mut free = 0;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; null marks the outputs we don't want.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(unix)]
+fn free_space(dir: &Path) -> Option<u64> {
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    // SAFETY: statvfs only fills in `stats`, for which all-zero bytes are a valid value.
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(path.as_ptr(), &mut stats) } == 0).then(|| stats.f_bavail as u64 * stats.f_frsize as u64)
 }
 
 /// One part of a path from the other device, turned into a plain file name that works on every OS.
@@ -353,6 +617,9 @@ fn safe_name(seg: &str) -> Result<String> {
         seg.chars().map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
     if name.ends_with(['.', ' ']) {
         name.push('_'); // Windows silently strips these, which could merge two names
+    }
+    if name.to_lowercase().ends_with(".toss-part") {
+        name.push('_'); // our temp-file suffix: "a.toss-part" would be the partial copy of "a"
     }
     let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
     let numbered = stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.ends_with(|c: char| c.is_ascii_digit());
@@ -382,7 +649,7 @@ async fn copy_exact(
     mut from: impl AsyncRead + Unpin,
     to: &mut (impl AsyncWrite + Unpin),
     len: u64,
-    progress: &mut Progress,
+    progress: &mut Progress<'_, impl Ui>,
 ) -> Result<()> {
     let mut buf = vec![0; 256 * 1024];
     let mut left = len;
@@ -397,33 +664,27 @@ async fn copy_exact(
     Ok(())
 }
 
-struct Progress {
+/// Passes progress to the UI at most 4 times a second, plus once at the end.
+struct Progress<'a, U> {
+    ui: &'a U,
     done: u64,
     total: u64,
     last: Instant,
-    tty: bool, // no live progress in logs (systemd), only the final line
 }
 
-impl Progress {
-    fn new(total: u64) -> Self {
-        Self { done: 0, total, last: Instant::now(), tty: std::io::stdout().is_terminal() }
+impl<'a, U: Ui> Progress<'a, U> {
+    fn new(ui: &'a U, total: u64) -> Self {
+        Self { ui, done: 0, total, last: Instant::now() }
     }
     fn add(&mut self, n: u64) {
         self.done += n;
-        if self.tty && self.last.elapsed() > Duration::from_millis(250) {
+        if self.done < self.total && self.last.elapsed() > Duration::from_millis(250) {
             self.last = Instant::now();
-            self.print();
+            self.ui.progress(self.done, self.total);
         }
-    }
-    fn print(&self) {
-        print!("\r  {:.1} / {:.1} MB", mb(self.done), mb(self.total));
-        let _ = std::io::stdout().flush();
     }
     fn finish(&self) {
-        if self.tty {
-            self.print();
-            println!();
-        }
+        self.ui.progress(self.total, self.total);
     }
 }
 
@@ -466,8 +727,11 @@ async fn send_msg(w: &mut (impl AsyncWrite + Unpin), msg: &impl Serialize) -> Re
 async fn recv_msg<T: DeserializeOwned>(r: &mut (impl AsyncRead + Unpin)) -> Result<T> {
     let len = r.read_u32().await? as usize;
     ensure!(len <= MAX_MSG, "message too large");
-    let mut bytes = vec![0; len];
-    r.read_exact(&mut bytes).await?;
+    // Grow the buffer as bytes arrive: reserving `len` up front would let anyone who connects make us
+    // hold 16 MB per connection by sending 4 bytes.
+    let mut bytes = Vec::new();
+    (&mut *r).take(len as u64).read_to_end(&mut bytes).await?;
+    ensure!(bytes.len() == len, "message ended early");
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -531,10 +795,11 @@ fn add_contact(home: &Path, name: &str, peer: EndpointId) -> Result<()> {
     })
 }
 
+/// Accepts the bare link or the whole "toss join toss:… <name>" line someone pasted.
 fn parse_link(link: &str) -> Result<(EndpointId, Vec<u8>)> {
     let (id, secret) = link
-        .trim()
-        .strip_prefix("toss:")
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("toss:"))
         .and_then(|s| s.split_once('/'))
         .context("not a toss invite link")?;
     Ok((id.parse()?, unhex(secret).context("not a toss invite link")?))
@@ -555,6 +820,29 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
+fn downloads_dir() -> Result<PathBuf> {
+    dirs::download_dir().or_else(dirs::home_dir).context("no downloads folder")
+}
+
+/// "1 file", "3 files"
+fn count(files: usize) -> String {
+    if files == 1 { "1 file".into() } else { format!("{files} files") }
+}
+
+/// "12 KB", "512.0 MB", "12.4 GB"
+fn human(bytes: u64) -> String {
+    match bytes {
+        1_000_000_000.. => format!("{:.1} GB", bytes as f64 / 1e9),
+        1_000_000.. => format!("{:.1} MB", mb(bytes)),
+        _ => format!("{:.0} KB", bytes as f64 / 1e3),
+    }
+}
+
+/// "continued after 12.4 GB" when a transfer picked up where an earlier try stopped.
+fn continued(resumed: u64) -> Option<String> {
+    (resumed > 0).then(|| format!("continued after {}", human(resumed)))
+}
+
 fn mb(bytes: u64) -> f64 {
     bytes as f64 / 1e6
 }
@@ -565,9 +853,8 @@ mod tests {
 
     #[test]
     fn paths_stay_inside_downloads_and_work_on_every_os() {
-        let dl = Path::new("dl");
         for bad in ["", "..", "a/../b", "/etc/passwd", "a//b", "dir/."] {
-            assert!(plan(&[(bad.into(), 1)], dl, |_| false).is_err(), "{bad:?} should be rejected");
+            assert!(sanitize(&[(bad.into(), 1)]).is_err(), "{bad:?} should be rejected");
         }
         for (from, to) in [
             ("a.txt", "a.txt"),
@@ -582,6 +869,8 @@ mod tests {
             ("aux.c", "aux_.c"),
             ("COM1.log", "COM1_.log"),
             ("company.txt", "company.txt"),
+            ("a.bin.toss-part", "a.bin.toss-part_"),
+            ("A.BIN.TOSS-PART", "A.BIN.TOSS-PART_"),
         ] {
             assert_eq!(safe_name(from).unwrap(), to);
         }
@@ -613,9 +902,67 @@ mod tests {
     fn never_overwrites_or_collides() {
         let dl = Path::new("dl");
         let files = [("a.txt".into(), 1), ("a (1).txt".into(), 1), ("dir/x".into(), 1), ("dir/y".into(), 1)];
-        let dests = plan(&files, dl, |p| p == dl.join("a.txt") || p == dl.join("dir")).unwrap();
-        assert_eq!(dests, [dl.join("a (1).txt"), dl.join("a (1) (1).txt"), dl.join("dir (1)/x"), dl.join("dir (1)/y")]);
-        assert!(plan(&[("A.txt".into(), 1), ("a.txt".into(), 1)], dl, |_| false).is_err());
+        let paths = sanitize(&files).unwrap();
+        let tops = free_tops(&paths, dl, |p| p == dl.join("a.txt") || p == dl.join("dir"));
+        let want = [("a.txt", "a (1).txt"), ("a (1).txt", "a (1) (1).txt"), ("dir", "dir (1)")];
+        assert_eq!(tops, want.map(|(top, name)| (top, name.to_string())));
+        assert!(sanitize(&[("A.txt".into(), 1), ("a.txt".into(), 1)]).is_err());
+    }
+
+    #[test]
+    fn finds_what_an_earlier_try_left() {
+        let dir = std::env::temp_dir().join(format!("toss-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join("big.bin");
+        assert_eq!(already_have(&staged, 10), 0);
+        assert_eq!(proof(&staged, 0).unwrap(), "");
+        std::fs::write(part_of(&staged), b"hello").unwrap();
+        assert_eq!(already_have(&staged, 10), 5);
+        assert_eq!(already_have(&staged, 3), 3, "never more than the file's size");
+        assert_eq!(proof(&staged, 5).unwrap(), blake3::hash(b"hello").to_hex().to_string());
+        std::fs::write(&staged, b"0123456789").unwrap();
+        assert_eq!(already_have(&staged, 10), 10, "a finished copy wins over a part");
+        assert_eq!(proof(&staged, 10).unwrap(), blake3::hash(b"0123456789").to_hex().to_string());
+        assert_eq!(already_have(&staged, 12), 5, "a finished copy of the wrong size doesn't count");
+        assert!(free_space(&dir).is_some_and(|free| free > 0), "the OS reports free space");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resuming_drops_junk_and_keeps_confirmed_files() {
+        let dir = std::env::temp_dir().join(format!("toss-resume-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let staged = dir.join("f.bin");
+        std::fs::write(part_of(&staged), b"hello WORLD").unwrap(); // the sender confirmed only "hello"
+        let mut progress = Progress::new(&Cli, 10);
+        receive_file(&mut &b"12345"[..], &staged, 5, 10, &mut progress).await.unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"hello12345");
+        assert!(!part_of(&staged).exists(), "the part became the finished file");
+        receive_file(&mut &b""[..], &staged, 10, 10, &mut progress).await.unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), b"hello12345", "a confirmed finished file is left alone");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn same_files_in_any_order_share_a_staging_folder() {
+        let dl = Path::new("dl");
+        let (a, b) = (("a.iso".to_string(), 1), ("b.iso".to_string(), 2));
+        assert_eq!(staging_dir(dl, "me", &[a.clone(), b.clone()]), staging_dir(dl, "me", &[b.clone(), a.clone()]));
+        assert_ne!(staging_dir(dl, "me", &[a.clone(), b]), staging_dir(dl, "me", &[a, ("b.iso".into(), 3)]));
+    }
+
+    #[tokio::test]
+    async fn messages_roundtrip_and_short_ones_fail() {
+        let mut wire = Vec::new();
+        send_msg(&mut wire, &vec![1u64, 2]).await.unwrap();
+        assert_eq!(recv_msg::<Vec<u64>>(&mut &wire[..]).await.unwrap(), [1, 2]);
+        let claims_16_mb = (16u32 << 20).to_be_bytes();
+        assert!(recv_msg::<Vec<u64>>(&mut &claims_16_mb[..]).await.is_err(), "4 bytes can't pass for 16 MB");
+    }
+
+    #[test]
+    fn sizes_read_naturally() {
+        assert_eq!([human(12_000), human(512_000_000), human(12_400_000_000)], ["12 KB", "512.0 MB", "12.4 GB"]);
     }
 
     #[test]
@@ -623,6 +970,8 @@ mod tests {
         let id = SecretKey::generate().public();
         let (got_id, got_secret) = parse_link(&format!(" toss:{id}/{} ", hex(&[7; 16]))).unwrap();
         assert_eq!((got_id, got_secret), (id, vec![7; 16]));
+        let pasted = format!("toss join toss:{id}/{} <name for you>", hex(&[7; 16]));
+        assert_eq!(parse_link(&pasted).unwrap().0, id);
         assert!(parse_link("toss:nope").is_err());
     }
 }

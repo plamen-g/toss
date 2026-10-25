@@ -1,8 +1,14 @@
+<p align="center"><img src="assets/logo.jpg" width="160" alt="toss logo: a figure throwing a glowing file"></p>
+
 # toss
 
 Send files to your own devices and your friends, peer to peer. No IP addresses, no accounts, no cloud.
 
 You pair with someone once by sending them an invite link. After that you toss files to them by name, from any network.
+
+Run `toss` with no arguments to open the window. Closing it keeps toss running in the system tray so it can still receive. When something arrives the window pops back up. Quit from the tray icon's menu. (On GNOME the tray needs the "AppIndicator and KStatusNotifierItem Support" extension.)
+
+Everything is also on the command line:
 
 ```
 toss invite laptop                  # prints a link; send it to the other device
@@ -13,7 +19,13 @@ toss send laptop report.pdf photos/ # files and folders
 
 Other commands: `toss contacts` and `toss forget <name>`. When a transfer arrives you can answer **a**lways to auto-accept that contact from then on.
 
-## Build
+## Install
+
+Download the file for your system from [Releases](https://github.com/plamen-g/toss/releases) and put `toss` somewhere on your PATH. The builds aren't signed yet:
+- **Windows:** SmartScreen may warn once. Click "More info" → "Run anyway".
+- **macOS:** clear the download flag with `xattr -d com.apple.quarantine toss`.
+
+Or build it yourself:
 
 ```
 cargo build --release   # target/release/toss, ~5 MB
@@ -52,16 +64,19 @@ Tested between a home PC (Windows) and a Hetzner ARM VPS (Helsinki): direct conn
 - **Receiving:**
   - Transfers from devices that aren't contacts are dropped.
   - Paths from the sender are checked so nothing can land outside your Downloads folder.
-  - File names are made valid for your OS, for example `10:30.log` becomes `10_30.log` and `con.txt` becomes `con_.txt`.
+  - File names are made valid for your OS, for example `10:30.log` becomes `10_30.log` and `con.txt` becomes `con_.txt`. Names ending in toss's own `.toss-part` get a `_` added, so they can't clash with an unfinished file.
   - Existing files are never overwritten; a new copy becomes `name (1).ext`.
-  - Unfinished files keep a `.toss-part` name and are removed when a transfer fails. A killed `toss` can leave one behind.
+  - Before asking you, toss checks there's enough free disk space; if not, the sender is told so.
+- **Big files:** files stream in 256 KB pieces, so memory stays around 10 MB however large they are.
+  - Incoming files collect in `Downloads/.toss-incoming` and only move into Downloads once everything has arrived.
+  - If a transfer breaks, send the same files again: toss continues where it stopped.
+  - Before continuing, both sides compare a BLAKE3 hash of the part already received, so a changed source file or a damaged partial starts over instead of producing a mixed-up file.
+  - Abandoned partial transfers stay in `.toss-incoming` until you delete them.
 
 Keys and contacts live in your config folder (`%APPDATA%\toss`, `~/.config/toss`, `~/Library/Application Support/toss`).
 
 ## Not yet
 
-- A tray app with a window. The command line comes first.
-- Resuming interrupted transfers.
 - Nearby discovery on the same Wi-Fi.
 - An MCP server.
 

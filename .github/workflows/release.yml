@@ -1,0 +1,43 @@
+# Push a tag like v0.1.0 and this builds toss for every platform and attaches the files to a GitHub release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, file: toss-windows-x86_64.exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, file: toss-macos-arm64.tar.gz }
+          - { os: macos-latest, target: x86_64-apple-darwin, file: toss-macos-x86_64.tar.gz }
+          # 22.04 so the binary also runs on older glibc (Ubuntu 22.04, Debian 12)
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, file: toss-linux-x86_64.tar.gz }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, file: toss-linux-arm64.tar.gz }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --locked
+        if: matrix.target != 'x86_64-apple-darwin' # cross-built on an ARM Mac, can't run its tests
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: |
+          dir=target/${{ matrix.target }}/release
+          if [[ "${{ matrix.file }}" == *.exe ]]; then cp "$dir/toss.exe" "${{ matrix.file }}"; else tar czf "${{ matrix.file }}" -C "$dir" toss; fi
+      - name: upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true # whichever job is first creates it
+          gh release upload "$GITHUB_REF_NAME" "${{ matrix.file }}" --clobber
