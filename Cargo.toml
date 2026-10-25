@@ -9,13 +9,15 @@ license = "MIT"
 anyhow = "1"
 blake3 = "1"
 dirs = "6"
+icu_normalizer = "2" # already in the build through iroh; compares file names like a Mac does
 iroh = "1.4.1"
+qrcodegen = "1.8"
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Software renderer only: the GPU renderers cost 50-150 MB of RAM for a window this simple.
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "software-renderer-systemfonts", "accessibility", "system-tray", "software-renderer-path"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "time", "sync"] }
 
 [profile.release]
 opt-level = "s"

@@ -2,7 +2,7 @@
 
 # toss
 
-Send files to your own devices and your friends, peer to peer. No IP addresses, no accounts, no cloud.
+Send files to your own devices and your friends, peer to peer. No IP addresses to type, no accounts, and your files never sit on a server.
 
 You pair with someone once by sending them an invite link. After that you toss files to them by name, from any network.
 
@@ -19,6 +19,33 @@ toss send laptop report.pdf photos/ # files and folders
 
 Other commands: `toss contacts` and `toss forget <name>`. When a transfer arrives you can answer **a**lways to auto-accept that contact from then on.
 
+## Phones, no app
+
+Click **Phone** in the window (or run `toss phone [file]...`) and scan the QR code with the phone's camera. The phone's browser opens a page served by your computer, with nothing in between: it downloads the files you chose, and can send photos and files back into your Downloads folder.
+
+- The phone has to be on a network that can reach the computer, like the same home Wi-Fi.
+- The page isn't encrypted. Browsers only trust certificates a home computer can't get, so it's plain HTTP. A one-time secret in the link keeps others out, and the link stops working when you leave the page. Use it at home, not on public Wi-Fi.
+- The first time, Windows asks whether toss may accept connections. Allow it for private networks.
+- On an iPhone, downloads land in Files › Downloads. From there, "Save to Photos" puts pictures and videos in Photos.
+
+## Privacy: what others can see
+
+Every transfer is encrypted end to end (QUIC with TLS 1.3). Only the device you send to can read your files, or even their names. What others can see is *that* you transfer, with whom and when:
+
+- **The other device** learns your IP address, because devices connect directly.
+- **n0**, the company behind iroh, runs the free servers toss uses by default to help devices find each other. It sees your IP address and device ID, which devices connect to each other and when, and how much passes through its relay when no direct path works. Your device tells n0's lookup service which relay it uses every 5 minutes.
+- **Your internet provider or Wi-Fi network** sees encrypted traffic: that you transfer something, and how much.
+- **The phone page** is the exception: it isn't encrypted, so someone who can intercept traffic on your Wi-Fi could see the page's link and the files.
+
+The limits, and what to do about them:
+
+- **n0 sees who talks to whom.** [Run your own relay](#use-your-own-relay): with one set, toss doesn't contact n0 at all.
+- **Even on the same Wi-Fi**, where files go straight from one device to the other, n0 helps them find each other, so it learns that they connected (not what, and almost nothing about how much). A relay you run at home, on a Raspberry Pi or a NAS, takes n0 out of that too.
+- **Removing a device doesn't hide you from it.** It still knows your device ID, so it can see which relay region you use and when you're online, and it can knock (toss turns it away). To cut it off completely, delete the `key` file in toss's config folder: toss makes a new identity, and you pair your other devices again.
+- **An invite link works like a ticket:** whoever uses it first is paired with you. Send links over a channel you trust (in person, or a private messenger), and check your device list afterwards.
+- **The phone page** is for your home network, not public Wi-Fi.
+- **On macOS and Linux**, received files don't get the "downloaded from the internet" mark Windows uses (see below), so the window offers Show in folder but not Open there. Open received files with the care you'd give an email attachment.
+
 ## Install
 
 Download the file for your system from [Releases](https://github.com/plamen-g/toss/releases) and put `toss` somewhere on your PATH. The builds aren't signed yet:
@@ -28,7 +55,7 @@ Download the file for your system from [Releases](https://github.com/plamen-g/to
 Or build it yourself:
 
 ```
-cargo build --release   # target/release/toss, ~5 MB
+cargo build --release   # target/release/toss, ~13 MB
 ```
 
 Run two separate identities on one machine by giving each its own `TOSS_HOME` folder.
@@ -64,7 +91,8 @@ Tested between a home PC (Windows) and a Hetzner ARM VPS (Helsinki): direct conn
 - **Receiving:**
   - Transfers from devices that aren't contacts are dropped.
   - Paths from the sender are checked so nothing can land outside your Downloads folder.
-  - File names are made valid for your OS, for example `10:30.log` becomes `10_30.log` and `con.txt` becomes `con_.txt`. Names ending in toss's own `.toss-part` get a `_` added, so they can't clash with an unfinished file.
+  - File names are made valid for your OS, for example `10:30.log` becomes `10_30.log` and `con.txt` becomes `con_.txt`. Names ending in toss's own `.toss-part` get a `_` added, so they can't clash with an unfinished file. Invisible characters that can make a name display backwards (so `photo.exe` poses as a `.jpg`) are replaced too.
+  - On Windows, received files carry the same "downloaded from the internet" mark as browser downloads, so Windows warns before running a program and Office opens documents read-only.
   - Existing files are never overwritten; a new copy becomes `name (1).ext`.
   - Before asking you, toss checks there's enough free disk space; if not, the sender is told so.
 - **Big files:** files stream in 256 KB pieces, so memory stays around 10 MB however large they are.
@@ -75,11 +103,38 @@ Tested between a home PC (Windows) and a Hetzner ARM VPS (Helsinki): direct conn
 
 Keys and contacts live in your config folder (`%APPDATA%\toss`, `~/.config/toss`, `~/Library/Application Support/toss`).
 
+## Use your own relay
+
+Most transfers go directly between devices. A relay only helps them find each other, and carries the
+(still encrypted) data when a direct path is impossible. By default toss uses n0's free public relays,
+which are meant for personal use. Running your own, at a business or at home, keeps even "who talked to
+whom" in-house:
+
+1. Run [`iroh-relay`](https://github.com/n0-computer/iroh) on a small server with a hostname, using
+   `iroh-relay --config-path relay.toml`:
+   ```toml
+   enable_relay = true
+   enable_quic_addr_discovery = true
+   access.shared_token = ["<long random token>"]  # only your devices may use it
+
+   [tls]
+   hostname = ["relay.example.com"]
+   cert_mode = "LetsEncrypt"
+   contact = "it@example.com"
+   prod_tls = true
+   ```
+   Open TCP 80 and 443 and UDP 7842.
+2. On every device: `toss relay https://relay.example.com <token>`. It's stored in `relay.json` in
+   toss's config folder, so IT can also deploy that file. `toss relay off` goes back. A token needs
+   an `https://` address, so it never crosses the network readable.
+
+Devices can only reach each other through the same relay, so set it on all of them.
+
 ## Not yet
 
 - Nearby discovery on the same Wi-Fi.
+- A short code to compare on both screens after pairing, against an intercepted invite link.
+- The macOS "downloaded from the internet" flag on received files.
 - An MCP server.
 
-Uses n0's free public relays, which are meant for hobby use.
-
-MIT licensed.
+MIT licensed. The display font is [Bricolage Grotesque](https://github.com/ateliertriay/bricolage), under the SIL Open Font License (`assets/OFL-BricolageGrotesque.txt`).

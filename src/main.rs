@@ -2,6 +2,7 @@
 //! Devices are known by public key (iroh), never by IP address.
 
 mod gui;
+mod phone;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -13,19 +14,22 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use icu_normalizer::ComposingNormalizerBorrowed;
 use iroh::{
-    Endpoint, EndpointId, SecretKey, Signature,
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey, Signature,
     endpoint::{Connection, Incoming, PortmapperConfig, VarInt, WeakConnectionHandle, presets},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
-// v2 adds resuming; the version is in the protocol name so mismatched builds fail cleanly.
-const ALPN: &[u8] = b"toss/2";
+// v2 adds resuming, v3 checks who's calling before reading their file list. The version is in the
+// protocol name so mismatched builds fail cleanly.
+const ALPN: &[u8] = b"toss/3";
 const INVITE_ALPN: &[u8] = b"toss/invite/1";
 const DIALER: &[u8] = b"dialer";
 const ACCEPTOR: &[u8] = b"acceptor";
-const MAX_MSG: usize = 16 << 20;
+const MAX_MSG: usize = 16 << 20; // a file list
+const MAX_HELLO: usize = 4 << 10; // a key, a signature and maybe an invite secret
 // The receiver's first reply to an offer.
 const DECLINED: u8 = 0;
 const ACCEPTED: u8 = 1;
@@ -38,7 +42,11 @@ const USAGE: &str = "usage:
   toss contacts               list contacts
   toss forget <name>          remove a contact
   toss send <name> <path>...  send files or folders to a contact
-  toss listen                 receive files (keep it running)";
+  toss listen                 receive files (keep it running)
+  toss phone [file]...        a QR code for a phone on your network: it downloads these files,
+                              or sends files here, in its browser
+  toss relay <url> [token]    use your own relay server; every device you send to needs the same
+  toss relay off              back to the free public relays";
 
 #[tokio::main]
 async fn main() {
@@ -52,6 +60,12 @@ async fn main() {
         ["forget", name] => forget(name).map(|()| println!("Forgot {name}.")),
         ["send", name, paths @ ..] if !paths.is_empty() => send(name, paths, &Cli).await,
         ["listen"] => listen(Arc::new(Cli)).await,
+        ["phone", files @ ..] => phone::cli(files).await,
+        ["relay"] => show_relay(),
+        ["relay", "off"] => set_relay(None),
+        ["relay", url, token @ ..] if token.len() <= 1 => {
+            set_relay(Some(Relay { url: url.to_string(), token: token.first().map(|t| t.to_string()) }))
+        }
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2)
@@ -73,10 +87,11 @@ enum Answer {
 enum Event<'a> {
     Ready(&'a Path),
     Waiting { to: &'a str, files: usize },
+    Sending { to: &'a str, files: usize }, // no approval needed (the phone page)
     Sent { to: &'a str, files: usize, direct: bool, mb_per_s: Option<f64>, resumed: u64 },
     Receiving { from: &'a str, files: usize },
     Checking { bytes: u64 }, // hashing what an earlier try left before continuing; minutes on a slow disk
-    Received { from: &'a str, files: usize, resumed: u64 },
+    Received { from: &'a str, files: usize, resumed: u64, saved: &'a [PathBuf] }, // one path per top-level item
     Declined { from: &'a str },
     Failed(String),
 }
@@ -85,7 +100,8 @@ enum Event<'a> {
 trait Ui: Sync {
     fn event(&self, event: Event);
     fn progress(&self, done: u64, total: u64);
-    fn accept(&self, from: &str, files: &[(String, u64)]) -> impl Future<Output = Answer> + Send;
+    /// Asks whether to take the files. `gone` finishes if the sender gives up (or sends again) first.
+    fn accept(&self, from: &str, files: &[(String, u64)], gone: impl Future<Output = ()> + Send) -> impl Future<Output = Answer> + Send;
 }
 
 struct Cli;
@@ -95,6 +111,7 @@ impl Ui for Cli {
         match event {
             Event::Ready(dir) => println!("Ready to receive. Files go to {}.", dir.display()),
             Event::Waiting { to, .. } => println!("Waiting for {to} to accept..."),
+            Event::Sending { to, files } => println!("Sending {} to {to}...", count(files)),
             Event::Sent { to, files, direct, mb_per_s, resumed } => {
                 let mut notes = vec![if direct { "direct" } else { "via relay" }.to_string()];
                 notes.extend(mb_per_s.map(|s| format!("{s:.1} MB/s")));
@@ -103,7 +120,7 @@ impl Ui for Cli {
             }
             Event::Receiving { from, files } => println!("Receiving {} from {from}...", count(files)),
             Event::Checking { bytes } => println!("Checking {} from an earlier try...", human(bytes)),
-            Event::Received { from, files, resumed } => match continued(resumed) {
+            Event::Received { from, files, resumed, .. } => match continued(resumed) {
                 Some(note) => println!("Received {} from {from} ({note}).", count(files)),
                 None => println!("Received {} from {from}.", count(files)),
             },
@@ -123,7 +140,8 @@ impl Ui for Cli {
         let _ = std::io::stdout().flush();
     }
 
-    fn accept(&self, from: &str, files: &[(String, u64)]) -> impl Future<Output = Answer> + Send {
+    // A terminal read can't be called off, so here the question stays until it's answered.
+    fn accept(&self, from: &str, files: &[(String, u64)], _gone: impl Future<Output = ()> + Send) -> impl Future<Output = Answer> + Send {
         let total: u64 = files.iter().map(|f| f.1).sum();
         println!("\n{from} wants to send {}, {}:", count(files.len()), human(total));
         for (name, size) in files.iter().take(10) {
@@ -150,16 +168,14 @@ struct Contact {
 }
 type Contacts = BTreeMap<String, Contact>;
 
-/// First message on every connection: who I am, proven by signing this connection's TLS keys.
-/// The same message carries the invite secret (join) or the file list (send).
+/// First message on every connection: who I am, proven by signing this connection's TLS keys. A join
+/// adds the invite secret; a send follows it with the file list, which is read only once we know them.
 #[derive(Serialize, Deserialize)]
 struct Hello {
     from: String,
     sig: Vec<u8>,
     #[serde(default)]
     secret: Vec<u8>,
-    #[serde(default)]
-    files: Vec<(String, u64)>, // '/'-separated relative path, size in bytes
 }
 
 async fn cli_invite(name: &str) -> Result<()> {
@@ -178,9 +194,7 @@ async fn invite(name: &str) -> Result<(String, impl Future<Output = Result<()>> 
     ensure!(!load_contacts(&home)?.contains_key(name), "you already have a contact called {name}");
     // A throwaway key, so a leaked link never reveals your real device id.
     let ep = bind(SecretKey::generate(), &[INVITE_ALPN]).await?;
-    tokio::time::timeout(Duration::from_secs(15), ep.online())
-        .await
-        .context("can't reach the internet, so nobody could join")?;
+    online(&ep).await?;
     let secret = SecretKey::generate().to_bytes()[..16].to_vec(); // 16 bytes from the OS random generator
     let link = format!("toss:{}/{}", ep.id(), hex(&secret));
     let name = name.to_string();
@@ -205,7 +219,7 @@ async fn invite(name: &str) -> Result<(String, impl Future<Output = Result<()>> 
 async fn accept_join(incoming: Incoming, me: &SecretKey, secret: &[u8]) -> Result<EndpointId> {
     let conn = incoming.await?;
     let (mut tx, mut rx) = conn.accept_bi().await?;
-    let h: Hello = recv_msg(&mut rx).await?;
+    let h: Hello = recv_msg(&mut rx, MAX_HELLO).await?;
     ensure!(same(&h.secret, secret), "wrong invite secret");
     let peer = verify(&conn, &h, DIALER)?;
     send_msg(&mut tx, &introduce(&conn, me, ACCEPTOR)?).await?;
@@ -221,12 +235,12 @@ async fn join(link: &str, name: &str) -> Result<()> {
     let (id, secret) = parse_link(link)?;
     let ep = bind(SecretKey::generate(), &[]).await?;
     let conn = ep
-        .connect(id, INVITE_ALPN)
+        .connect(reach(&ep, id).await?, INVITE_ALPN)
         .await
         .context("couldn't reach the inviter. Is their `toss invite` still running?")?;
     let (mut tx, mut rx) = conn.open_bi().await?;
     send_msg(&mut tx, &Hello { secret, ..introduce(&conn, &me, DIALER)? }).await?;
-    let peer = verify(&conn, &recv_msg(&mut rx).await?, ACCEPTOR)?;
+    let peer = verify(&conn, &recv_msg(&mut rx, MAX_HELLO).await?, ACCEPTOR)?;
     add_contact(&home, name, peer)?;
     ep.close().await;
     Ok(())
@@ -276,12 +290,13 @@ async fn send(name: &str, paths: &[impl AsRef<Path>], ui: &impl Ui) -> Result<()
     // Dial from a throwaway key so a `toss listen` on this machine keeps the real one. The signature proves who we are.
     let ep = bind(SecretKey::generate(), &[]).await?;
     let conn = ep
-        .connect(peer, ALPN)
+        .connect(reach(&ep, peer).await?, ALPN)
         .await
         .with_context(|| format!("couldn't reach {name}. Is `toss listen` running there?"))?;
     let (mut tx, mut rx) = conn.open_bi().await?;
-    let files_msg = files.iter().map(|(rel, _, size)| (rel.clone(), *size)).collect();
-    send_msg(&mut tx, &Hello { files: files_msg, ..introduce(&conn, &me, DIALER)? }).await?;
+    send_msg(&mut tx, &introduce(&conn, &me, DIALER)?).await?;
+    let offer: Vec<(&str, u64)> = files.iter().map(|(rel, _, size)| (rel.as_str(), *size)).collect(); // '/'-separated path, size
+    send_msg(&mut tx, &offer).await?;
     ui.event(Event::Waiting { to: name, files: files.len() });
     match rx.read_u8().await {
         Ok(ACCEPTED) => {}
@@ -290,7 +305,7 @@ async fn send(name: &str, paths: &[impl AsRef<Path>], ui: &impl Ui) -> Result<()
     }
     // They say how much of each file they already have, with a hash of it. Continue from there only
     // where our copy starts with exactly those bytes; anything else starts over.
-    let proofs: Vec<(u64, String)> = recv_msg(&mut rx).await?;
+    let proofs: Vec<(u64, String)> = recv_msg(&mut rx, MAX_MSG).await?;
     ensure!(proofs.len() == files.len(), "{name} sent a bad resume list");
     let had: u64 = proofs.iter().map(|(have, _)| have).sum();
     if had > 0 {
@@ -387,24 +402,28 @@ fn lock_listener(home: &Path) -> Result<std::fs::File> {
 
 async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui, turns: &Turns) -> Result<()> {
     let conn = incoming.await?;
-    // Anyone who learns our id can connect, so a silent connection must not block the queue.
-    let (mut tx, mut rx, offer) = tokio::time::timeout(Duration::from_secs(30), async {
+    // Anyone who learns our id can connect: a silent connection must not block the queue, and a
+    // stranger gets to send only a few KB before we know it's one.
+    let (mut tx, mut rx, hello) = tokio::time::timeout(Duration::from_secs(30), async {
         let (tx, mut rx) = conn.accept_bi().await?;
-        let offer: Hello = recv_msg(&mut rx).await?;
-        anyhow::Ok((tx, rx, offer))
+        let hello: Hello = recv_msg(&mut rx, MAX_HELLO).await?;
+        anyhow::Ok((tx, rx, hello))
     })
     .await
-    .context("timed out waiting for the file list")??;
-    let from = verify(&conn, &offer, DIALER)?.to_string();
+    .context("timed out waiting to hear who's calling")??;
+    let from = verify(&conn, &hello, DIALER)?.to_string();
     let contacts = load_contacts(home)?; // reload: pairing may have happened in another process
     let name = contacts
         .iter()
         .find(|(_, c)| c.id == from)
         .map(|(n, _)| n.clone())
         .context("ignored a transfer from a device that isn't a contact")?;
-    let paths = sanitize(&offer.files)?;
+    let files: Vec<(String, u64)> = tokio::time::timeout(Duration::from_secs(30), recv_msg(&mut rx, MAX_MSG))
+        .await
+        .context("timed out waiting for the file list")??;
+    let paths = sanitize(&files)?;
     // Files collect in a folder of their own and move into Downloads only once all have arrived.
-    let staging = staging_dir(downloads, &from, &offer.files);
+    let staging = staging_dir(downloads, &from, &files);
     // A resend of the same files means the earlier try is dead or unwanted: end it now rather than
     // waiting out its 30 s timeout, then continue from what it left.
     let writer = {
@@ -417,8 +436,8 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui
     };
     let _writing = writer.lock_owned().await;
     let staged: Vec<PathBuf> = paths.iter().map(|segs| staging.join(segs.iter().collect::<PathBuf>())).collect();
-    let have: Vec<u64> = staged.iter().zip(&offer.files).map(|(path, (_, size))| already_have(path, *size)).collect();
-    let total = offer.files.iter().try_fold(0u64, |sum, f| sum.checked_add(f.1)).context("file sizes in the offer don't add up")?;
+    let have: Vec<u64> = staged.iter().zip(&files).map(|(path, (_, size))| already_have(path, *size)).collect();
+    let total = files.iter().try_fold(0u64, |sum, f| sum.checked_add(f.1)).context("file sizes in the offer don't add up")?;
     let needed = total - have.iter().sum::<u64>();
     if let Some(free) = free_space(downloads).filter(|free| *free < needed) {
         tx.write_u8(NO_SPACE).await?;
@@ -426,13 +445,13 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui
     }
 
     // Show the cleaned names, never the raw ones: they could hide terminal control codes.
-    let shown: Vec<(String, u64)> = paths.iter().zip(&offer.files).map(|(segs, (_, size))| (segs.join("/"), *size)).collect();
+    let shown: Vec<(String, u64)> = paths.iter().zip(&files).map(|(segs, (_, size))| (segs.join("/"), *size)).collect();
     let answer = if contacts[&name].auto_accept {
         ui.event(Event::Receiving { from: &name, files: shown.len() });
         Answer::Yes
     } else {
         let _asking = turns.ask.lock().await;
-        ui.accept(&name, &shown).await
+        ui.accept(&name, &shown, async { conn.closed().await; }).await
     };
     if let Answer::Always = answer {
         update_contacts(home, |c| {
@@ -443,6 +462,9 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui
         })?;
     }
     if let Answer::No = answer {
+        if conn.close_reason().is_some() {
+            return Ok(()); // they gave up while we asked: nothing to report
+        }
         tx.write_u8(DECLINED).await?;
         ui.event(Event::Declined { from: &name });
         return Ok(());
@@ -459,7 +481,7 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui
     })
     .await??;
     send_msg(&mut tx, &proofs).await?;
-    let starts: Vec<u64> = recv_msg(&mut rx).await?;
+    let starts: Vec<u64> = recv_msg(&mut rx, MAX_MSG).await?;
     // Only "from the start" or "from what we have" is valid; anything else would leave holes in files.
     ensure!(
         starts.len() == have.len() && starts.iter().zip(&have).all(|(start, have)| *start == 0 || start == have),
@@ -468,18 +490,20 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui
     let resumed: u64 = starts.iter().sum();
     let mut progress = Progress::new(ui, total);
     progress.done = resumed;
-    for ((path, (_, size)), start) in staged.iter().zip(&offer.files).zip(&starts) {
+    for ((path, (_, size)), start) in staged.iter().zip(&files).zip(&starts) {
         receive_file(&mut rx, path, *start, *size, &mut progress).await?;
     }
+    let mut saved = Vec::new();
     for (top, name) in free_tops(&paths, downloads, |p| p.exists()) {
-        tokio::fs::rename(staging.join(top), downloads.join(name)).await?;
+        tokio::fs::rename(staging.join(top), downloads.join(&name)).await?;
+        saved.push(downloads.join(name));
     }
     let _ = tokio::fs::remove_dir_all(&staging).await;
     let _ = tokio::fs::remove_dir(staging.parent().expect("staging is inside .toss-incoming")).await; // only if empty
     tx.write_u8(1).await?;
     tx.finish()?;
     progress.finish();
-    ui.event(Event::Received { from: &name, files: offer.files.len(), resumed });
+    ui.event(Event::Received { from: &name, files: files.len(), resumed, saved: &saved });
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await; // let the confirmation arrive
     Ok(())
 }
@@ -508,6 +532,7 @@ async fn receive_file(
     file.flush().await?;
     drop(file); // Windows can't rename an open file
     tokio::fs::rename(&part, staged).await?;
+    mark_downloaded(staged);
     Ok(())
 }
 
@@ -527,6 +552,19 @@ fn staging_dir(downloads: &Path, from: &str, files: &[(String, u64)]) -> PathBuf
     }
     downloads.join(".toss-incoming").join(&key.finalize().to_hex()[..16])
 }
+
+/// Tags a received file the way browsers tag downloads (the "Mark of the Web"), so Windows warns
+/// before running it and Office opens it read-only. Disks that can't hold the tag (FAT) skip it.
+#[cfg(windows)]
+fn mark_downloaded(file: &Path) {
+    let mut tag = file.as_os_str().to_owned();
+    tag.push(":Zone.Identifier");
+    let _ = std::fs::write(tag, "[ZoneTransfer]\r\nZoneId=3\r\n");
+}
+
+// shortcut: macOS has a "quarantine" flag for the same job; set it once toss has been tried on a Mac.
+#[cfg(not(windows))]
+fn mark_downloaded(_: &Path) {}
 
 fn part_of(staged: &Path) -> PathBuf {
     let mut part = staged.as_os_str().to_owned();
@@ -566,7 +604,10 @@ fn sanitize(files: &[(String, u64)]) -> Result<Vec<Vec<String>>> {
         .iter()
         .map(|(rel, _)| {
             let segs = rel.split('/').map(safe_name).collect::<Result<Vec<_>>>()?;
-            ensure!(seen.insert(segs.join("/").to_lowercase()), "duplicate path in offer: {rel}");
+            // Compare names the way the strictest disk does: Windows ignores case, and a Mac treats an
+            // accented letter and a letter followed by an accent mark as the same name.
+            let key = ComposingNormalizerBorrowed::new_nfc().normalize(&segs.join("/")).to_lowercase();
+            ensure!(seen.insert(key), "duplicate path in offer: {rel}");
             Ok(segs)
         })
         .collect()
@@ -613,8 +654,12 @@ fn free_space(dir: &Path) -> Option<u64> {
 /// Separators can't survive, so nothing can land outside the downloads folder.
 fn safe_name(seg: &str) -> Result<String> {
     ensure!(!matches!(seg, "" | "." | ".."), "unsafe path in offer");
-    let mut name: String =
-        seg.chars().map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
+    // Direction marks are invisible, but one can make "photo<RLO>gpj.exe" display as "photoexe.jpg".
+    let direction_mark = |c| matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    let mut name: String = seg
+        .chars()
+        .map(|c| if c.is_control() || direction_mark(c) || r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .collect();
     if name.ends_with(['.', ' ']) {
         name.push('_'); // Windows silently strips these, which could merge two names
     }
@@ -655,7 +700,8 @@ async fn copy_exact(
     let mut left = len;
     while left > 0 {
         let chunk = left.min(buf.len() as u64) as usize;
-        let n = from.read(&mut buf[..chunk]).await?;
+        // A peer that vanished without closing (a phone leaving the Wi-Fi) would otherwise hang here forever.
+        let n = tokio::time::timeout(Duration::from_secs(60), from.read(&mut buf[..chunk])).await.context("no data for a minute")??;
         ensure!(n > 0, "data ended early");
         to.write_all(&buf[..n]).await?;
         left -= n as u64;
@@ -690,7 +736,7 @@ impl<'a, U: Ui> Progress<'a, U> {
 
 fn introduce(conn: &Connection, me: &SecretKey, role: &[u8]) -> Result<Hello> {
     let sig = me.sign(&binding(conn, role)?).to_bytes().to_vec();
-    Ok(Hello { from: me.public().to_string(), sig, secret: vec![], files: vec![] })
+    Ok(Hello { from: me.public().to_string(), sig, secret: vec![] })
 }
 
 fn verify(conn: &Connection, h: &Hello, role: &[u8]) -> Result<EndpointId> {
@@ -709,12 +755,89 @@ fn binding(conn: &Connection, role: &[u8]) -> Result<[u8; 32]> {
 }
 
 async fn bind(key: SecretKey, alpns: &[&[u8]]) -> Result<Endpoint> {
-    Ok(Endpoint::builder(presets::N0)
+    let builder = match load_relay(&home()?)? {
+        // Their own relay replaces n0's servers entirely: the relays and the lookup service.
+        Some(relay) => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(relay_map(&relay)?)),
+        None => Endpoint::builder(presets::N0),
+    };
+    Ok(builder
         .secret_key(key)
         .alpns(alpns.iter().map(|a| a.to_vec()).collect())
         .portmapper_config(PortmapperConfig::Disabled) // UPnP probing can trigger firewall prompts
         .bind()
         .await?)
+}
+
+/// A relay server someone runs for their own devices (`toss relay <url> [token]`). Without one,
+/// toss uses n0's free public relays and their lookup service.
+#[derive(Serialize, Deserialize)]
+struct Relay {
+    url: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+fn load_relay(home: &Path) -> Result<Option<Relay>> {
+    match std::fs::read(home.join("relay.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).context("relay.json is corrupt")?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn relay_map(relay: &Relay) -> Result<RelayMap> {
+    let url: RelayUrl = relay.url.parse().context("not a relay URL")?;
+    ensure!(matches!(url.scheme(), "https" | "http"), "a relay URL starts with https://");
+    // Over plain http the token would cross the network readable; only a relay on this computer may skip https.
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    ensure!(relay.token.is_none() || url.scheme() == "https" || local, "a relay token needs an https:// address");
+    let config = RelayConfig::from(url);
+    Ok(match &relay.token {
+        Some(token) => config.with_auth_token(token),
+        None => config,
+    }
+    .into())
+}
+
+/// How to dial a device: by key through n0's lookup service, or through the custom relay, which
+/// every device using it can be reached through.
+async fn reach(ep: &Endpoint, id: EndpointId) -> Result<EndpointAddr> {
+    let Some(relay) = load_relay(&home()?)? else { return Ok(EndpointAddr::new(id)) };
+    online(ep).await?; // the relay is the only way there, so a rejected token mustn't look like them being offline
+    Ok(EndpointAddr::new(id).with_relay_url(relay.url.parse()?))
+}
+
+async fn online(ep: &Endpoint) -> Result<()> {
+    let why = match load_relay(&home()?)? {
+        Some(relay) => format!("can't connect to the relay at {}. Check its address and token", relay.url),
+        None => "can't reach the internet".to_string(),
+    };
+    tokio::time::timeout(Duration::from_secs(15), ep.online()).await.map_err(|_| anyhow!(why))
+}
+
+fn set_relay(relay: Option<Relay>) -> Result<()> {
+    let path = home()?.join("relay.json");
+    let Some(relay) = relay else {
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e).context("couldn't remove relay.json");
+        }
+        println!("Using the free public relays again. Restart toss if it's open.");
+        return Ok(());
+    };
+    relay_map(&relay)?; // refuse a bad URL now, not at the next transfer
+    write_private(&path, &serde_json::to_vec_pretty(&relay)?)?;
+    println!("Using {}. Every device you send to needs the same setting. Restart toss if it's open.", relay.url);
+    Ok(())
+}
+
+fn show_relay() -> Result<()> {
+    match load_relay(&home()?)? {
+        Some(relay) => println!("Using {}{}.", relay.url, if relay.token.is_some() { " with a token" } else { "" }),
+        None => println!("Using the free public relays."),
+    }
+    Ok(())
 }
 
 async fn send_msg(w: &mut (impl AsyncWrite + Unpin), msg: &impl Serialize) -> Result<()> {
@@ -724,9 +847,9 @@ async fn send_msg(w: &mut (impl AsyncWrite + Unpin), msg: &impl Serialize) -> Re
     Ok(())
 }
 
-async fn recv_msg<T: DeserializeOwned>(r: &mut (impl AsyncRead + Unpin)) -> Result<T> {
+async fn recv_msg<T: DeserializeOwned>(r: &mut (impl AsyncRead + Unpin), max: usize) -> Result<T> {
     let len = r.read_u32().await? as usize;
-    ensure!(len <= MAX_MSG, "message too large");
+    ensure!(len <= max, "message too large");
     // Grow the buffer as bytes arrive: reserving `len` up front would let anyone who connects make us
     // hold 16 MB per connection by sending 4 bytes.
     let mut bytes = Vec::new();
@@ -783,14 +906,26 @@ fn update_contacts(home: &Path, change: impl FnOnce(&mut Contacts) -> Result<()>
     let mut contacts = load_contacts(home)?;
     change(&mut contacts)?;
     let tmp = home.join("contacts.json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&contacts)?)?;
+    write_private(&tmp, &serde_json::to_vec_pretty(&contacts)?)?;
     std::fs::rename(tmp, home.join("contacts.json"))?; // a crash never leaves a half-written file
     Ok(())
 }
 
+/// Writes a file only this user can read. On unix the default lets every account read it, and these
+/// files hold a relay token or the list of who you're paired with. (Windows profile folders are private.)
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    Ok(opts.open(path)?.write_all(bytes)?)
+}
+
 fn add_contact(home: &Path, name: &str, peer: EndpointId) -> Result<()> {
+    let id = peer.to_string();
     update_contacts(home, |c| {
-        c.insert(name.into(), Contact { id: peer.to_string(), auto_accept: false });
+        c.retain(|_, contact| contact.id != id); // a device paired again keeps one name, the new one
+        c.insert(name.into(), Contact { id, auto_accept: false });
         Ok(())
     })
 }
@@ -871,6 +1006,7 @@ mod tests {
             ("company.txt", "company.txt"),
             ("a.bin.toss-part", "a.bin.toss-part_"),
             ("A.BIN.TOSS-PART", "A.BIN.TOSS-PART_"),
+            ("photo\u{202E}gpj.exe", "photo_gpj.exe"),
         ] {
             assert_eq!(safe_name(from).unwrap(), to);
         }
@@ -907,6 +1043,21 @@ mod tests {
         let want = [("a.txt", "a (1).txt"), ("a (1).txt", "a (1) (1).txt"), ("dir", "dir (1)")];
         assert_eq!(tops, want.map(|(top, name)| (top, name.to_string())));
         assert!(sanitize(&[("A.txt".into(), 1), ("a.txt".into(), 1)]).is_err());
+        assert!(sanitize(&[("caf\u{e9}".into(), 1), ("cafe\u{301}".into(), 1)]).is_err(), "one name on a Mac");
+    }
+
+    #[test]
+    fn pairing_a_device_again_replaces_its_old_name() {
+        let home = std::env::temp_dir().join(format!("toss-contacts-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (laptop, phone) = (SecretKey::generate().public(), SecretKey::generate().public());
+        add_contact(&home, "laptop", laptop).unwrap();
+        add_contact(&home, "phone", phone).unwrap();
+        add_contact(&home, "work laptop", laptop).unwrap();
+        assert_eq!(load_contacts(&home).unwrap().keys().collect::<Vec<_>>(), ["phone", "work laptop"]);
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(home.join("contacts.json")).unwrap().permissions()) & 0o777, 0o600);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
@@ -938,6 +1089,8 @@ mod tests {
         receive_file(&mut &b"12345"[..], &staged, 5, 10, &mut progress).await.unwrap();
         assert_eq!(std::fs::read(&staged).unwrap(), b"hello12345");
         assert!(!part_of(&staged).exists(), "the part became the finished file");
+        #[cfg(windows)]
+        assert!(std::fs::read_to_string(format!("{}:Zone.Identifier", staged.display())).unwrap().contains("ZoneId=3"));
         receive_file(&mut &b""[..], &staged, 10, 10, &mut progress).await.unwrap();
         assert_eq!(std::fs::read(&staged).unwrap(), b"hello12345", "a confirmed finished file is left alone");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -955,9 +1108,24 @@ mod tests {
     async fn messages_roundtrip_and_short_ones_fail() {
         let mut wire = Vec::new();
         send_msg(&mut wire, &vec![1u64, 2]).await.unwrap();
-        assert_eq!(recv_msg::<Vec<u64>>(&mut &wire[..]).await.unwrap(), [1, 2]);
+        assert_eq!(recv_msg::<Vec<u64>>(&mut &wire[..], MAX_MSG).await.unwrap(), [1, 2]);
         let claims_16_mb = (16u32 << 20).to_be_bytes();
-        assert!(recv_msg::<Vec<u64>>(&mut &claims_16_mb[..]).await.is_err(), "4 bytes can't pass for 16 MB");
+        assert!(recv_msg::<Vec<u64>>(&mut &claims_16_mb[..], MAX_MSG).await.is_err(), "4 bytes can't pass for 16 MB");
+        // A stranger's first message is refused by its declared size, before any of it is read.
+        let claims_5_kb = (5u32 << 10).to_be_bytes();
+        let err = recv_msg::<Hello>(&mut &claims_5_kb[..], MAX_HELLO).await.err().unwrap();
+        assert_eq!(err.to_string(), "message too large");
+    }
+
+    #[test]
+    fn relay_settings_are_checked() {
+        let relay = |url: &str| Relay { url: url.into(), token: Some("secret".into()) };
+        assert!(relay_map(&relay("https://relay.example.com")).is_ok());
+        assert!(relay_map(&relay("not a url")).is_err());
+        assert!(relay_map(&relay("ftp:/relay")).is_err());
+        assert!(relay_map(&relay("http://relay.example.com")).is_err(), "the token would travel in the clear");
+        assert!(relay_map(&relay("http://127.0.0.1:3340")).is_ok(), "a relay on this computer is fine");
+        assert!(relay_map(&Relay { url: "http://relay.example.com".into(), token: None }).is_ok());
     }
 
     #[test]

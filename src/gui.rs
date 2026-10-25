@@ -1,24 +1,27 @@
 //! The window: your devices, what's happening right now, an Accept/Decline card for incoming files,
-//! and an "Add device" page for pairing. It keeps receiving from the tray after the window closes.
+//! an "Add device" page for pairing, and a "Phone" page with a QR code for a phone's browser. It keeps
+//! receiving from the tray after the window closes.
 
 use std::{
     future::Future,
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
 };
 
 use anyhow::Result;
-use slint::{Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{Color, ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use tokio::sync::oneshot;
 
 use crate::{Answer, Event, Ui, count, human};
 
 slint::slint! {
     import { ListView, Palette } from "std-widgets.slint";
+    import "assets/BricolageGrotesque-Bold.ttf"; // the wordmark and page titles; names stay in the system font
 
     export struct Device { name: string, initial: string, tint: color, auto: bool }
 
-    // Colors from the logo: deep navy with a cyan glow.
+    // Colors from the logo: deep navy with a cyan glow. Cyan is for files leaving, amber for files arriving.
     global Theme {
         out property <color> bg-top: #102349;
         out property <color> bg-bottom: #091429;
@@ -31,7 +34,11 @@ slint::slint! {
         out property <color> accent-hover: #67e8f9;
         out property <color> accent-pressed: #06b6d4;
         out property <color> on-accent: #062a33;
-        out property <color> ok: #34d399;
+        out property <color> catch: #fbbf24;
+        out property <color> catch-hover: #fcd34d;
+        out property <color> catch-pressed: #f59e0b;
+        out property <color> on-catch: #3b2300;
+        out property <string> display-font: "Bricolage Grotesque 96pt";
         out property <color> bad: #fb7185;
     }
 
@@ -45,6 +52,7 @@ slint::slint! {
         out property <string> folder: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z";
         out property <string> back: "M19 12H5M12 19l-7-7 7-7";
         out property <string> trash: "M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3";
+        out property <string> phone: "M8 2h8a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zM11 18h2";
         out property <string> link: "M10 14a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-1 1M14 10a4 4 0 0 0-6 0l-3 3a4 4 0 0 0 6 6l1-1";
     }
 
@@ -70,6 +78,86 @@ slint::slint! {
         Icon { x: 11px; y: 11px; commands: root.icon; stroke: root.tint; }
     }
 
+    // A document with a folded corner: the thing being tossed.
+    component FileGlyph inherits Path {
+        width: 14px;
+        height: 18px;
+        viewbox-width: 14;
+        viewbox-height: 18;
+        commands: "M1 1h8l4 4v12H1z";
+        stroke-width: 0px;
+        accessible-role: none;
+    }
+
+    // 5: a file dropping into place; plays once, when the card for a caught transfer appears.
+    component CaughtBadge inherits Rectangle {
+        property <float> fall: 0;
+        animate fall { duration: 700ms; easing: ease-out-bounce; }
+        init => { root.fall = 1; }
+        width: 40px;
+        height: 40px;
+        border-radius: 20px;
+        background: Theme.catch.transparentize(0.82);
+        FileGlyph { x: 13px; y: -20px + 31px * root.fall; fill: Theme.catch; }
+    }
+
+    // 1 and 5: a transfer flies along an arc from the sender (left) to the receiver (right). The file
+    // is tossed up into the air as the card appears, then rides the arc with the progress.
+    component Flight inherits Rectangle {
+        in property <float> progress; // 0 to 1
+        in property <color> ink;
+        in property <bool> incoming; // the other device is the sender, so it sits on the left
+        in property <string> peer-initial;
+        in property <color> peer-tint;
+        property <float> shown: root.progress;
+        property <float> thrown: 0;
+        property <length> span: root.width - 48px;
+        animate shown { duration: 250ms; } // progress arrives 4 times a second; glide between
+        animate thrown { duration: 500ms; easing: ease-out-back; }
+        init => { root.thrown = 1; }
+        height: 64px;
+        accessible-role: none;
+
+        for i in 15: Rectangle {
+            property <float> t: (i + 1) / 16.0;
+            x: 24px + root.span * self.t - 2px;
+            y: 52px - 160px * self.t * (1 - self.t) - 2px;
+            width: 4px;
+            height: 4px;
+            border-radius: 2px;
+            background: self.t <= root.shown ? root.ink : #ffffff26;
+        }
+        Rectangle { // you
+            x: (root.incoming ? root.width - 24px : 24px) - 6px;
+            y: 46px;
+            width: 12px;
+            height: 12px;
+            border-radius: 6px;
+            background: root.ink;
+        }
+        Rectangle { // them
+            x: (root.incoming ? 24px : root.width - 24px) - 14px;
+            y: 38px;
+            width: 28px;
+            height: 28px;
+            border-radius: 14px;
+            background: root.peer-tint;
+            Text {
+                text: root.peer-initial;
+                color: white;
+                font-size: 13px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        FileGlyph {
+            x: 24px + root.span * root.shown - 7px;
+            y: 52px - 160px * root.shown * (1 - root.shown) - 9px + (1 - root.thrown) * 22px;
+            fill: root.ink;
+        }
+    }
+
     component Avatar inherits Rectangle {
         in property <string> letter;
         in property <color> tint;
@@ -89,11 +177,12 @@ slint::slint! {
 
     component Card inherits Rectangle {
         in property <bool> highlight;
+        in property <color> tint: Theme.accent; // the highlight's color
         vertical-stretch: 0; // spare height belongs to the device list
         border-radius: 16px;
         border-width: 1px;
-        border-color: root.highlight ? Theme.accent.transparentize(0.45) : Theme.line;
-        background: root.highlight ? Theme.accent.transparentize(0.9) : Theme.surface;
+        border-color: root.highlight ? root.tint.transparentize(0.45) : Theme.line;
+        background: root.highlight ? root.tint.transparentize(0.9) : Theme.surface;
     }
 
     // Our own buttons, so toss looks the same everywhere; they keep keyboard and screen-reader support.
@@ -103,10 +192,14 @@ slint::slint! {
         in property <string> icon;
         in property <bool> primary;
         in property <bool> danger;
+        in property <bool> warm; // amber instead of cyan: for files arriving
         in property <bool> enabled: true;
         callback clicked;
         private property <color> ink: !root.enabled ? Theme.muted.transparentize(0.35)
-            : root.primary ? Theme.on-accent : root.danger ? Theme.bad : Theme.text;
+            : root.primary ? (root.warm ? Theme.on-catch : Theme.on-accent) : root.danger ? Theme.bad : Theme.text;
+        private property <color> fill: root.warm ? Theme.catch : Theme.accent;
+        private property <color> fill-hover: root.warm ? Theme.catch-hover : Theme.accent-hover;
+        private property <color> fill-pressed: root.warm ? Theme.catch-pressed : Theme.accent-pressed;
 
         accessible-role: button;
         accessible-label: root.label != "" ? root.label : root.text;
@@ -119,7 +212,7 @@ slint::slint! {
         border-width: focus.has-focus ? 2px : (root.primary && root.enabled ? 0px : 1px);
         border-color: focus.has-focus ? Theme.accent-hover : root.danger ? Theme.bad.transparentize(0.5) : Theme.line;
         background: !root.enabled ? Theme.surface
-            : root.primary ? (touch.pressed ? Theme.accent-pressed : touch.has-hover ? Theme.accent-hover : Theme.accent)
+            : root.primary ? (touch.pressed ? root.fill-pressed : touch.has-hover ? root.fill-hover : root.fill)
             : root.danger ? (touch.has-hover ? Theme.bad.transparentize(0.72) : Theme.bad.transparentize(0.85))
             : (touch.pressed ? #ffffff2e : touch.has-hover ? Theme.surface-hover : Theme.surface);
 
@@ -291,6 +384,7 @@ slint::slint! {
 
     component Bar inherits Rectangle {
         in property <float> value;
+        in property <color> fill: Theme.accent;
         accessible-role: progress-indicator;
         accessible-value: round(root.value * 100) + "%";
         height: 6px;
@@ -300,7 +394,7 @@ slint::slint! {
             x: 0;
             width: parent.width * clamp(root.value, 0, 1);
             border-radius: 3px;
-            background: Theme.accent;
+            background: root.fill;
         }
     }
 
@@ -330,8 +424,8 @@ slint::slint! {
                 VerticalLayout {
                     alignment: center;
                     PillButton {
-                        text: "Send";
-                        label: "Send files to " + root.device.name;
+                        text: "Toss";
+                        label: "Toss files to " + root.device.name;
                         icon: Icons.up;
                         primary: true;
                         clicked => { root.send-files(root.device.name); }
@@ -366,7 +460,7 @@ slint::slint! {
                     padding: 6px;
                     spacing: 2px;
                     if !root.confirming: MenuRow {
-                        text: "Send a folder";
+                        text: "Toss a folder";
                         icon: Icons.folder;
                         clicked => {
                             menu.close();
@@ -423,10 +517,13 @@ slint::slint! {
 
         in property <[Device]> devices;
         in property <bool> receiving: true;
-        in property <int> act-kind; // 0 nothing yet (card hidden), 1 sending, 2 receiving, 3 done, 4 problem, 5 note
+        in property <int> act-kind; // 0 nothing yet (card hidden), 1 tossing, 2 catching, 3 done, 4 problem, 5 note, 6 caught
+        in property <string> act-peer-initial; // the other end of the flight arc
+        in property <color> act-peer-tint;
         in property <string> act-title;
         in property <string> act-detail;
-        in property <bool> act-folder;
+        in property <bool> act-folder; // the card is about received files: offer to show them
+        in property <bool> act-open; // ...and it's a single file, so it can be opened
         in property <float> progress: -1; // below 0 hides the bar
         in property <string> offer-from; // incoming files waiting for an answer, "" when none
         in property <string> offer-initial;
@@ -437,17 +534,25 @@ slint::slint! {
         in property <string> pair-error;
         in property <bool> busy; // joining
         in-out property <bool> copied;
-        in-out property <int> page; // 0 devices, 1 add device
+        in-out property <int> page; // 0 devices, 1 add device, 2 phone
+        in property <image> phone-qr;
+        in property <string> phone-url; // "" while the phone page's server isn't running
+        in property <string> phone-offered; // names of the files the phone can download
+        in property <string> phone-error;
+        callback phone-open();
+        callback phone-offer();
+        callback phone-close();
         callback send-files(string);
         callback send-folder(string);
         callback forget(string);
         callback invite(string);
         callback join(string, string);
         callback answer(int); // 0 decline, 1 accept, 2 always
-        callback open-downloads();
+        callback open-saved();
+        callback show-saved();
 
-        private property <color> kind-color: root.act-kind == 3 ? Theme.ok : root.act-kind == 4 ? Theme.bad
-            : root.act-kind == 5 ? Theme.muted : Theme.accent;
+        private property <color> kind-color: root.act-kind == 2 || root.act-kind == 6 ? Theme.catch
+            : root.act-kind == 4 ? Theme.bad : root.act-kind == 5 ? Theme.muted : Theme.accent;
         private property <string> kind-icon: root.act-kind == 1 ? Icons.up : root.act-kind == 3 ? Icons.check
             : root.act-kind == 4 ? Icons.alert : Icons.down;
 
@@ -467,9 +572,21 @@ slint::slint! {
                         accessible-role: none;
                     }
                 }
-                VerticalLayout { alignment: center; horizontal-stretch: 0; Text { text: "toss"; font-size: 23px; font-weight: 800; color: Theme.text; } }
+                VerticalLayout { alignment: center; horizontal-stretch: 0; Text { text: "toss"; font-family: Theme.display-font; font-size: 27px; font-weight: 700; color: Theme.text; } }
                 if !root.receiving: VerticalLayout { alignment: center; horizontal-stretch: 0; StatusPill { } }
                 Rectangle { horizontal-stretch: 1; }
+                VerticalLayout {
+                    alignment: center;
+                    PillButton {
+                        text: "Phone";
+                        label: "Send to or from a phone's browser";
+                        icon: Icons.phone;
+                        clicked => {
+                            root.page = 2;
+                            root.phone-open();
+                        }
+                    }
+                }
                 VerticalLayout {
                     alignment: center;
                     PillButton { text: "Add device"; icon: Icons.plus; clicked => { root.page = 1; } }
@@ -478,13 +595,27 @@ slint::slint! {
             if root.page == 1: HorizontalLayout {
                 spacing: 8px;
                 IconButton { icon: Icons.back; label: "Back"; clicked => { root.page = 0; } }
-                VerticalLayout { alignment: center; Text { text: "Add device"; font-size: 20px; font-weight: 800; color: Theme.text; } }
+                VerticalLayout { alignment: center; Text { text: "Add device"; font-family: Theme.display-font; font-size: 22px; font-weight: 700; color: Theme.text; } }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            if root.page == 2: HorizontalLayout {
+                spacing: 8px;
+                IconButton {
+                    icon: Icons.back;
+                    label: "Back";
+                    clicked => {
+                        root.page = 0;
+                        root.phone-close();
+                    }
+                }
+                VerticalLayout { alignment: center; Text { text: "Phone"; font-family: Theme.display-font; font-size: 22px; font-weight: 700; color: Theme.text; } }
                 Rectangle { horizontal-stretch: 1; }
             }
 
             // Incoming files come first, whatever page is open.
             if root.offer-from != "": Card {
                 highlight: true;
+                tint: Theme.catch;
                 VerticalLayout {
                     padding: 16px;
                     spacing: 14px;
@@ -517,20 +648,24 @@ slint::slint! {
                         spacing: 8px;
                         alignment: end;
                         PillButton { text: "Decline"; clicked => { root.answer(0); } }
-                        PillButton { text: "Always accept"; label: "Always accept from " + root.offer-from; clicked => { root.answer(2); } }
-                        PillButton { text: "Accept"; icon: Icons.down; primary: true; clicked => { root.answer(1); } }
+                        PillButton { text: "Always catch"; label: "Always accept files from " + root.offer-from; clicked => { root.answer(2); } }
+                        PillButton { text: "Catch"; label: "Accept the files"; icon: Icons.down; primary: true; warm: true; clicked => { root.answer(1); } }
                     }
                 }
             }
 
             // What's happening right now.
-            if root.page == 0 && root.offer-from == "" && root.act-kind != 0: Card {
+            if (root.page == 0 || root.page == 2) && root.offer-from == "" && root.act-kind != 0: Card {
                 VerticalLayout {
                     padding: 16px;
                     spacing: 12px;
                     HorizontalLayout {
                         spacing: 14px;
-                        VerticalLayout { alignment: center; Badge { icon: root.kind-icon; tint: root.kind-color; } }
+                        VerticalLayout {
+                            alignment: center;
+                            if root.act-kind == 6: CaughtBadge { }
+                            if root.act-kind != 6: Badge { icon: root.kind-icon; tint: root.kind-color; }
+                        }
                         VerticalLayout {
                             alignment: center;
                             spacing: 3px;
@@ -538,17 +673,21 @@ slint::slint! {
                             Text { text: root.act-title; font-size: 16px; font-weight: 700; color: Theme.text; overflow: elide; }
                             Text { text: root.act-detail; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
                         }
-                        if root.act-folder: VerticalLayout {
-                            alignment: center;
-                            PillButton {
-                                text: "Show";
-                                label: "Open the Downloads folder";
-                                icon: Icons.folder;
-                                clicked => { root.open-downloads(); }
-                            }
-                        }
                     }
-                    if root.progress >= 0: Bar { value: root.progress; }
+                    if root.act-kind == 1 || root.act-kind == 2: Flight {
+                        progress: max(root.progress, 0);
+                        ink: root.kind-color;
+                        incoming: root.act-kind == 2;
+                        peer-initial: root.act-peer-initial;
+                        peer-tint: root.act-peer-tint;
+                    }
+                    if root.act-folder: HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        if root.act-open: PillButton { text: "Open"; label: "Open the received file"; primary: true; warm: true; clicked => { root.open-saved(); } }
+                        PillButton { text: "Show in folder"; icon: Icons.folder; clicked => { root.show-saved(); } }
+                    }
+                    if root.progress >= 0: Bar { value: root.progress; fill: root.kind-color; }
                 }
             }
 
@@ -563,9 +702,10 @@ slint::slint! {
                     spacing: 10px;
                     HorizontalLayout {
                         alignment: center;
-                        Image { source: @image-url("assets/icon-64.png"); width: 56px; height: 56px; accessible-role: none; }
+                        // 375x150 pixels: drawn 1:1 at 125% scaling, since the renderer resizes roughly
+                        Image { source: @image-url("assets/empty.png"); width: 300px; height: 120px; accessible-role: none; }
                     }
-                    Text { text: "No devices"; font-size: 17px; font-weight: 700; color: Theme.text; horizontal-alignment: center; }
+                    Text { text: "No devices"; font-family: Theme.display-font; font-size: 19px; font-weight: 700; color: Theme.text; horizontal-alignment: center; }
                     Text {
                         text: "Paired devices appear here.";
                         font-size: 13px;
@@ -609,7 +749,7 @@ slint::slint! {
                         PillButton {
                             text: "Create link";
                             primary: true;
-                            enabled: invite-name.text != "" && root.link == "";
+                            enabled: invite-name.text != "";
                             clicked => { root.invite(invite-name.text); }
                         }
                     }
@@ -680,7 +820,59 @@ slint::slint! {
                 }
             }
             if root.page == 1 && root.pair-error != "": Text { text: root.pair-error; color: Theme.bad; font-size: 13px; wrap: word-wrap; }
-            if root.page == 1 || (root.page == 0 && root.devices.length == 0): Rectangle { vertical-stretch: 1; }
+
+            if root.page == 2 && root.phone-url != "": Card {
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 212px;
+                            height: 212px;
+                            border-radius: 12px;
+                            background: white;
+                            Image {
+                                x: 6px;
+                                y: 6px;
+                                width: 200px;
+                                height: 200px;
+                                source: root.phone-qr;
+                                image-rendering: pixelated;
+                                accessible-role: none;
+                            }
+                        }
+                    }
+                    Text { text: "Scan with the phone camera"; font-size: 15px; font-weight: 700; color: Theme.text; horizontal-alignment: center; }
+                    Text {
+                        text: "Home network only: the page isn't encrypted.\n" + root.phone-url;
+                        font-size: 12px;
+                        color: Theme.muted;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            if root.page == 2 && root.phone-url != "": Card {
+                HorizontalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    VerticalLayout { alignment: center; Badge { icon: Icons.up; } }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text { text: "Offered to the phone"; font-size: 15px; font-weight: 700; color: Theme.text; }
+                        Text { text: root.phone-offered != "" ? root.phone-offered : "None"; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        PillButton { text: "Choose"; label: "Choose files for the phone"; clicked => { root.phone-offer(); } }
+                    }
+                }
+            }
+            if root.page == 2 && root.phone-error != "": Text { text: root.phone-error; color: Theme.bad; font-size: 13px; wrap: word-wrap; }
+            if root.page != 0 || root.devices.length == 0: Rectangle { vertical-stretch: 1; }
         }
     }
 
@@ -704,12 +896,16 @@ const RECEIVING: i32 = 2;
 const DONE: i32 = 3;
 const PROBLEM: i32 = 4;
 const NOTE: i32 = 5;
+const CAUGHT: i32 = 6;
 
 struct Gui {
     win: slint::Weak<AppWindow>,
     home: PathBuf,
     pending: Mutex<Option<oneshot::Sender<Answer>>>, // the Accept/Decline card waiting for a click
     transfer: Mutex<String>,                         // headline while bytes move, e.g. "Sending to laptop"
+    phone: Mutex<Option<crate::phone::Share>>,       // the phone page's server, while that page is open
+    saved: Mutex<Vec<PathBuf>>,                      // what the last "Received" card's buttons open
+    inviting: Mutex<Option<tokio::task::AbortHandle>>, // the invite link that's waiting, so a new one can replace it
 }
 
 impl Gui {
@@ -725,6 +921,15 @@ impl Gui {
             w.set_act_detail(detail.into());
             w.set_act_folder(folder);
             w.set_progress(-1.0);
+        });
+    }
+
+    /// Who's at the other end of the flight arc.
+    fn peer(&self, name: &str) {
+        let (letter, color) = (initial(name), tint(name));
+        self.update(move |w| {
+            w.set_act_peer_initial(letter);
+            w.set_act_peer_tint(color);
         });
     }
 
@@ -747,6 +952,28 @@ fn resumed_note(resumed: u64) -> &'static str {
     if resumed > 0 { " · resumed" } else { "" }
 }
 
+/// Up to four names, one per line, then "and 3 more".
+fn listed(names: Vec<String>) -> String {
+    let mut text = names[..names.len().min(4)].join("\n");
+    if names.len() > 4 {
+        text += &format!("\nand {} more", names.len() - 4);
+    }
+    text
+}
+
+/// The phone page's link as a QR code image, 5 pixels per module.
+fn qr_image(url: &str) -> SharedPixelBuffer<Rgb8Pixel> {
+    const SCALE: usize = 5;
+    let rows = crate::phone::qr(url);
+    let side = rows.len() * SCALE;
+    let mut image = SharedPixelBuffer::<Rgb8Pixel>::new(side as u32, side as u32);
+    for (i, pixel) in image.make_mut_slice().iter_mut().enumerate() {
+        let v = if rows[i / side / SCALE][i % side / SCALE] { 0 } else { 255 };
+        *pixel = Rgb8Pixel { r: v, g: v, b: v };
+    }
+    image
+}
+
 fn initial(name: &str) -> SharedString {
     name.chars().next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_default().into()
 }
@@ -764,31 +991,47 @@ impl Ui for Gui {
         match event {
             Event::Ready(_) => self.update(|w| w.set_receiving(true)),
             Event::Waiting { to, files } => {
-                *self.transfer.lock().expect("not poisoned") = format!("Sending to {to}");
-                self.show(SENDING, format!("Sending to {to}"), format!("Waiting for approval · {}", count(files)), false);
+                *self.transfer.lock().expect("not poisoned") = format!("Tossing to {to}");
+                self.peer(to);
+                self.show(SENDING, format!("Tossing to {to}"), format!("Waiting for approval · {}", count(files)), false);
+            }
+            Event::Sending { to, files } => {
+                *self.transfer.lock().expect("not poisoned") = format!("Tossing to {to}");
+                self.peer(to);
+                self.show(SENDING, format!("Tossing to {to}"), count(files), false);
             }
             Event::Sent { to, files, direct, mb_per_s, resumed } => {
                 let route = if direct { "direct" } else { "relayed" };
                 let speed = mb_per_s.map(|s| format!(" · {s:.1} MB/s")).unwrap_or_default();
                 let detail = format!("{} · {route}{speed}{}", count(files), resumed_note(resumed));
-                self.show(DONE, format!("Sent to {to}"), detail, false);
+                self.show(DONE, format!("Tossed to {to}"), detail, false);
             }
             Event::Receiving { from, files } => {
-                *self.transfer.lock().expect("not poisoned") = format!("Receiving from {from}");
-                self.show(RECEIVING, format!("Receiving from {from}"), count(files), false);
+                *self.transfer.lock().expect("not poisoned") = format!("Catching from {from}");
+                self.peer(from);
+                self.show(RECEIVING, format!("Catching from {from}"), count(files), false);
             }
             Event::Checking { bytes } => {
                 let detail = format!("Checking {} from an earlier try", human(bytes));
                 self.update(move |w| w.set_act_detail(detail.into()));
             }
-            Event::Received { from, files, resumed } => {
-                let detail = format!("{} · Downloads{}", count(files), resumed_note(resumed));
-                self.show(DONE, format!("Received from {from}"), detail, true)
+            Event::Received { from, files, resumed, saved } => {
+                // shortcut: no Open button on macOS and Linux, where received files carry no "downloaded" mark,
+                // so Open could launch a .terminal or .desktop file unchecked; add macOS's quarantine flag,
+                // tested on a Mac, to offer it there.
+                let one_file = cfg!(windows) && matches!(saved, [file] if file.is_file());
+                // Name a single file, so a program posing as something else is easier to spot.
+                let what = match saved {
+                    [item] if files == 1 => item.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    _ => count(files),
+                };
+                *self.saved.lock().expect("not poisoned") = saved.to_vec();
+                self.show(CAUGHT, format!("Caught from {from}"), format!("{what} · Downloads{}", resumed_note(resumed)), true);
+                self.update(move |w| w.set_act_open(one_file));
             }
             Event::Declined { from } => self.show(NOTE, "Transfer declined".into(), format!("From {from}"), false),
             Event::Failed(why) => self.show(PROBLEM, "Transfer failed".into(), why, false),
         }
-        self.refresh_devices(); // pairings and "always" answers change contacts; events are rare
     }
 
     // shortcut: transfers running at the same time share this one bar; give each its own row if that gets common.
@@ -805,13 +1048,10 @@ impl Ui for Gui {
         });
     }
 
-    fn accept(&self, from: &str, files: &[(String, u64)]) -> impl Future<Output = Answer> + Send {
+    fn accept(&self, from: &str, files: &[(String, u64)], gone: impl Future<Output = ()> + Send) -> impl Future<Output = Answer> + Send {
         let total: u64 = files.iter().map(|f| f.1).sum();
         let summary = format!("{} · {}", count(files.len()), human(total));
-        let mut names = files.iter().take(4).map(|f| f.0.as_str()).collect::<Vec<_>>().join("\n");
-        if files.len() > 4 {
-            names += &format!("\nand {} more", files.len() - 4);
-        }
+        let names = listed(files.iter().map(|f| f.0.clone()).collect());
         let (tx, rx) = oneshot::channel();
         *self.pending.lock().expect("not poisoned") = Some(tx);
         let from = from.to_string();
@@ -826,11 +1066,15 @@ impl Ui for Gui {
             w.set_offer_from(who.into());
         });
         async move {
-            let answer = rx.await.unwrap_or(Answer::No);
+            let answer = tokio::select! {
+                answer = rx => answer.unwrap_or(Answer::No),
+                () = gone => Answer::No, // they gave up or sent again: take the question down
+            };
             self.update(|w| w.set_offer_from("".into()));
             if !matches!(answer, Answer::No) {
-                *self.transfer.lock().expect("not poisoned") = format!("Receiving from {from}");
-                self.show(RECEIVING, format!("Receiving from {from}"), summary, false);
+                *self.transfer.lock().expect("not poisoned") = format!("Catching from {from}");
+                self.peer(&from);
+                self.show(RECEIVING, format!("Catching from {from}"), summary, false);
             }
             answer
         }
@@ -850,8 +1094,26 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     let win = AppWindow::new()?;
-    let gui = Arc::new(Gui { win: win.as_weak(), home, pending: Mutex::new(None), transfer: Mutex::default() });
+    let gui = Arc::new(Gui {
+        win: win.as_weak(),
+        home,
+        pending: Mutex::new(None),
+        transfer: Mutex::default(),
+        phone: Mutex::default(),
+        saved: Mutex::default(),
+        inviting: Mutex::default(),
+    });
     gui.refresh_devices();
+    // Pairing or removing devices from the terminal changes contacts.json behind the window's back.
+    let watch = slint::Timer::default();
+    let (g, mut seen) = (gui.clone(), None);
+    watch.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(2), move || {
+        let modified = std::fs::metadata(g.home.join("contacts.json")).and_then(|m| m.modified()).ok();
+        if modified != seen {
+            seen = modified;
+            g.refresh_devices();
+        }
+    });
 
     let g = gui.clone();
     tokio::spawn(async move {
@@ -863,9 +1125,18 @@ pub fn run() -> Result<()> {
 
     win.on_send_files(sender(&gui, |dialog| dialog.pick_files()));
     win.on_send_folder(sender(&gui, |dialog| dialog.pick_folder().map(|folder| vec![folder])));
-    win.on_open_downloads(|| {
-        if let Ok(dir) = crate::downloads_dir() {
-            open_folder(&dir);
+    let g = gui.clone();
+    win.on_open_saved(move || {
+        let saved = g.saved.lock().expect("not poisoned").clone();
+        if let Some(Err(e)) = saved.first().map(|file| open_file(file)) {
+            g.show(PROBLEM, "Couldn't open it".into(), e.to_string(), false);
+        }
+    });
+    let g = gui.clone();
+    win.on_show_saved(move || {
+        let saved = g.saved.lock().expect("not poisoned").clone();
+        if let Some(Err(e)) = saved.first().map(|item| reveal(item)) {
+            g.show(PROBLEM, "Couldn't show it".into(), e.to_string(), false);
         }
     });
 
@@ -880,25 +1151,34 @@ pub fn run() -> Result<()> {
 
     let g = gui.clone();
     win.on_invite(move |name| {
-        let g = g.clone();
-        g.update(|w| w.set_pair_error("".into()));
-        tokio::spawn(async move {
-            let name = name.trim().to_string();
-            let (link, joined) = match crate::invite(&name).await {
-                Ok(started) => started,
-                Err(e) => return g.update(move |w| w.set_pair_error(format!("{e:#}").into())),
-            };
-            g.update(move |w| {
-                w.set_copied(false);
-                w.set_link(link.into());
-            });
-            let res = joined.await;
-            g.update(|w| w.set_link("".into()));
-            match res {
-                Ok(()) => paired(&g, &name),
-                Err(e) => g.update(move |w| w.set_pair_error(format!("{e:#}").into())),
+        g.update(|w| {
+            w.set_pair_error("".into());
+            w.set_link("".into());
+        });
+        let task = tokio::spawn({
+            let g = g.clone();
+            async move {
+                let name = name.trim().to_string();
+                let (link, joined) = match crate::invite(&name).await {
+                    Ok(started) => started,
+                    Err(e) => return g.update(move |w| w.set_pair_error(format!("{e:#}").into())),
+                };
+                g.update(move |w| {
+                    w.set_copied(false);
+                    w.set_link(link.into());
+                });
+                let res = joined.await;
+                g.update(|w| w.set_link("".into()));
+                match res {
+                    Ok(()) => paired(&g, &name),
+                    Err(e) => g.update(move |w| w.set_pair_error(format!("{e:#}").into())),
+                }
             }
         });
+        // A new link replaces one nobody has used, say after a typo in the name.
+        if let Some(old) = g.inviting.lock().expect("not poisoned").replace(task.abort_handle()) {
+            old.abort();
+        }
     });
 
     let g = gui.clone();
@@ -928,6 +1208,48 @@ pub fn run() -> Result<()> {
                 _ => Answer::No,
             });
         }
+    });
+
+    let g = gui.clone();
+    win.on_phone_open(move || {
+        let started = crate::phone::start(g.clone());
+        let shown = started.as_ref().map(|share| (share.url.clone(), qr_image(&share.url))).map_err(|e| format!("{e:#}"));
+        *g.phone.lock().expect("not poisoned") = started.ok();
+        g.update(move |w| {
+            w.set_phone_offered("".into());
+            match shown {
+                Ok((url, qr)) => {
+                    w.set_phone_error("".into());
+                    w.set_phone_qr(Image::from_rgb8(qr));
+                    w.set_phone_url(url.into());
+                }
+                Err(e) => {
+                    w.set_phone_url("".into());
+                    w.set_phone_error(e.into());
+                }
+            }
+        });
+    });
+    let g = gui.clone();
+    win.on_phone_offer(move || {
+        let Some(files) = rfd::FileDialog::new().pick_files() else { return };
+        let names = listed(files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect());
+        if let Some(share) = &*g.phone.lock().expect("not poisoned") {
+            share.offer(files);
+        }
+        g.update(move |w| w.set_phone_offered(names.into()));
+    });
+    let g = gui.clone();
+    win.on_phone_close(move || drop(g.phone.lock().expect("not poisoned").take()));
+    let g = gui.clone();
+    win.window().on_close_requested(move || {
+        drop(g.phone.lock().expect("not poisoned").take()); // the phone link only works while its page shows
+        g.update(|w| {
+            if w.get_page() == 2 {
+                w.set_page(0);
+            }
+        });
+        slint::CloseRequestResponse::HideWindow
     });
 
     let tray = Tray::new()?;
@@ -962,21 +1284,42 @@ fn sender(gui: &Arc<Gui>, pick: fn(rfd::FileDialog) -> Option<Vec<PathBuf>>) -> 
         let gui = gui.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::send(&name, &paths, &*gui).await {
-                gui.show(PROBLEM, format!("Sending to {name} failed"), format!("{e:#}"), false);
+                gui.show(PROBLEM, format!("Tossing to {name} failed"), format!("{e:#}"), false);
             }
         });
     }
 }
 
-fn open_folder(dir: &Path) {
-    let opener = if cfg!(windows) {
+/// Opens a file in its default app: a picture in the photo viewer, a spreadsheet in Excel, and so on.
+fn open_file(file: &Path) -> std::io::Result<()> {
+    let mut cmd = Command::new(opener());
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::raw_arg(&mut cmd, format!("\"{}\"", file.display())); // unquoted, explorer cuts the path at a comma
+    #[cfg(not(windows))]
+    cmd.arg(file);
+    cmd.spawn().map(drop)
+}
+
+/// Shows a file or folder selected in its folder.
+fn reveal(item: &Path) -> std::io::Result<()> {
+    let mut cmd = Command::new(opener());
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::raw_arg(&mut cmd, format!("/select,\"{}\"", item.display())); // explorer's own argument rules
+    #[cfg(target_os = "macos")]
+    cmd.arg("-R").arg(item);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    cmd.arg(item.parent().unwrap_or(item)); // no standard way to select a file: open its folder
+    cmd.spawn().map(drop)
+}
+
+fn opener() -> &'static str {
+    if cfg!(windows) {
         "explorer"
     } else if cfg!(target_os = "macos") {
         "open"
     } else {
         "xdg-open"
-    };
-    let _ = std::process::Command::new(opener).arg(dir).spawn();
+    }
 }
 
 /// Started from Explorer, Windows gives a console program a console window; close it.
@@ -984,9 +1327,15 @@ fn open_folder(dir: &Path) {
 fn hide_console() {
     unsafe extern "system" {
         safe fn FreeConsole() -> i32;
+        safe fn SetStdHandle(which: u32, handle: *mut std::ffi::c_void) -> i32;
     }
     // shortcut: the console still flashes for a moment; ship a separate windows-subsystem binary with the installers.
     FreeConsole();
+    // The old console handles are dead now, and Windows refuses to start a program (Explorer, Photos)
+    // that would inherit them: forget them.
+    for which in [-10i32, -11, -12] {
+        SetStdHandle(which as u32, std::ptr::null_mut()); // stdin, stdout, stderr
+    }
 }
 
 #[cfg(not(windows))]
