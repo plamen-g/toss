@@ -10,13 +10,16 @@ anyhow = "1"
 blake3 = "1"
 dirs = "6"
 icu_normalizer = "2" # already in the build through iroh; compares file names like a Mac does
-iroh = "1.4.1"
+# On aws-lc-rs instead of ring, so every connection can use the hybrid post-quantum key exchange
+# (X25519 + ML-KEM-768) that rustls prefers below. Port mapping stays out: toss never used it.
+iroh = { version = "1.4.1", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath"] }
 qrcodegen = "1.8"
 rfd = "0.17.2"
+rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Software renderer only: the GPU renderers cost 50-150 MB of RAM for a window this simple.
-slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "software-renderer-systemfonts", "accessibility", "system-tray", "software-renderer-path"] }
+slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "software-renderer-systemfonts", "accessibility", "system-tray", "software-renderer-path", "unstable-winit-030"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "time", "sync"] }
 
 [profile.release]
@@ -33,3 +36,6 @@ libc = "0.2"
 # starting on servers without it, and needs its development files to build.
 [target.'cfg(target_os = "linux")'.dependencies]
 fontique = { version = "0.11", default-features = false, features = ["fontconfig-dlopen"] }
+
+[dev-dependencies]
+noq = { version = "1.4", default-features = false } # only to read which key exchange a test connection negotiated

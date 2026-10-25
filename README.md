@@ -6,7 +6,7 @@ Send files to your own devices and your friends, peer to peer. No IP addresses t
 
 You pair with someone once by sending them an invite link. After that you toss files to them by name, from any network.
 
-Run `toss` with no arguments to open the window. Closing it keeps toss running in the system tray so it can still receive. When something arrives the window pops back up. Quit from the tray icon's menu. (On GNOME the tray needs the "AppIndicator and KStatusNotifierItem Support" extension.)
+Run `toss` with no arguments to open the window. Drag files onto it (or click **Toss**) and pick a device. Closing it keeps toss running in the system tray so it can still receive. When something arrives the window pops back up. Quit from the tray icon's menu. (On GNOME the tray needs the "AppIndicator and KStatusNotifierItem Support" extension.)
 
 Everything is also on the command line:
 
@@ -25,12 +25,13 @@ Click **Phone** in the window (or run `toss phone [file]...`) and scan the QR co
 
 - The phone has to be on a network that can reach the computer, like the same home Wi-Fi.
 - The page isn't encrypted. Browsers only trust certificates a home computer can't get, so it's plain HTTP. A one-time secret in the link keeps others out, and the link stops working when you leave the page. Use it at home, not on public Wi-Fi.
+- The page belongs to the first device that opens it. Anyone else using the same link, say from a photo of the QR code, is turned away, and the window shows which device connected.
 - The first time, Windows asks whether toss may accept connections. Allow it for private networks.
 - On an iPhone, downloads land in Files › Downloads. From there, "Save to Photos" puts pictures and videos in Photos.
 
 ## Privacy: what others can see
 
-Every transfer is encrypted end to end (QUIC with TLS 1.3). Only the device you send to can read your files, or even their names. What others can see is *that* you transfer, with whom and when:
+Every transfer is encrypted end to end (QUIC with TLS 1.3), with a post-quantum key exchange (X25519 + ML-KEM-768), so traffic recorded today can't be decrypted by a quantum computer later. Only the device you send to can read your files, or even their names. What others can see is *that* you transfer, with whom and when:
 
 - **The other device** learns your IP address, because devices connect directly.
 - **n0**, the company behind iroh, runs the free servers toss uses by default to help devices find each other. It sees your IP address and device ID, which devices connect to each other and when, and how much passes through its relay when no direct path works. Your device tells n0's lookup service which relay it uses every 5 minutes.
@@ -85,7 +86,7 @@ Tested between a home PC (Windows) and a Hetzner ARM VPS (Helsinki): direct conn
 
 ## How it works
 
-- **Connections:** built on [iroh](https://iroh.computer). A device is its public key. iroh finds the device, connects directly through NATs when it can, and otherwise falls back to an encrypted relay. All traffic is QUIC with TLS 1.3, end to end.
+- **Connections:** built on [iroh](https://iroh.computer). A device is its public key. iroh finds the device, connects directly through NATs when it can, and otherwise falls back to an encrypted relay. All traffic is QUIC with TLS 1.3, end to end, with the same hybrid post-quantum key exchange browsers use (X25519 + ML-KEM-768).
 - **Invites:** an invite link holds a throwaway key and a 128-bit secret. Leaking a used or expired link reveals nothing about your real device id. Relays see the throwaway key, but only someone holding the secret can pair.
 - **Identity:** every connection opens with a signature over that connection's TLS key material. A contact's identity can't be faked or replayed, even when the connection itself is made from a throwaway key.
 - **Receiving:**
@@ -133,6 +134,7 @@ Devices can only reach each other through the same relay, so set it on all of th
 ## Not yet
 
 - Nearby discovery on the same Wi-Fi.
+- Drag and drop on Linux under Wayland (it works on Windows, macOS and X11).
 - A short code to compare on both screens after pairing, against an intercepted invite link.
 - The macOS "downloaded from the internet" flag on received files.
 - An MCP server.

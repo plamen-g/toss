@@ -31,6 +31,7 @@ struct State {
     offered: Mutex<Vec<PathBuf>>,
     uploading: tokio::sync::Mutex<()>, // one at a time, so two uploads can't pick the same free name
     received: Mutex<Vec<PathBuf>>,     // everything this page has received, so a batch reads as one
+    phone: Mutex<Option<IpAddr>>,      // the first device to use the link; anyone else holding it is turned away
 }
 
 impl Share {
@@ -58,15 +59,16 @@ pub fn start<U: Ui + Send + 'static>(ui: Arc<U>) -> Result<Share> {
         offered: Mutex::default(),
         uploading: tokio::sync::Mutex::default(),
         received: Mutex::default(),
+        phone: Mutex::default(),
     });
     let server = tokio::spawn({
         let state = state.clone();
         async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
+            while let Ok((mut stream, peer)) = listener.accept().await {
                 let (state, ui) = (state.clone(), ui.clone());
                 tokio::spawn(async move {
                     let (r, mut w) = stream.split();
-                    serve(&mut BufReader::new(r), &mut w, &state, &*ui).await;
+                    serve(&mut BufReader::new(r), &mut w, &state, &*ui, peer.ip()).await;
                     let _ = w.shutdown().await;
                 });
             }
@@ -121,12 +123,21 @@ fn lan_ip() -> Result<IpAddr> {
 }
 
 /// Answers one request, then the connection closes: browsers cope, and it keeps this parser small.
-async fn serve(r: &mut (impl AsyncBufRead + Unpin), w: &mut (impl AsyncWrite + Unpin), state: &State, ui: &impl Ui) {
+async fn serve(
+    r: &mut (impl AsyncBufRead + Unpin),
+    w: &mut (impl AsyncWrite + Unpin),
+    state: &State,
+    ui: &impl Ui,
+    peer: IpAddr,
+) {
     // Anyone on the network can connect: give up on silent or oversized requests.
     let Ok(Ok((method, target, len))) = tokio::time::timeout(Duration::from_secs(10), request(r)).await else { return };
     let mut parts = target.split('?').next().unwrap_or_default().trim_start_matches('/').splitn(3, '/');
     let res = if !parts.next().is_some_and(|s| same(s.as_bytes(), state.secret.as_bytes())) {
         reply(w, "404 Not Found", TEXT, b"Not found").await
+    } else if !claim(state, peer, ui) {
+        let text = b"This page is already open on another device. Open Phone again on the computer for a new code.";
+        reply(w, "403 Forbidden", TEXT, text).await
     } else {
         match (method.as_str(), parts.next(), parts.next()) {
             ("GET", None | Some(""), None) => reply(w, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()).await,
@@ -139,6 +150,20 @@ async fn serve(r: &mut (impl AsyncBufRead + Unpin), w: &mut (impl AsyncWrite + U
     if let Err(e) = res {
         ui.event(Event::Failed(format!("phone: {e:#}")));
     }
+}
+
+/// The first device to use the link gets the page. Anyone else holding it, from a sniffed or
+/// photographed code, is turned away.
+fn claim(state: &State, peer: IpAddr, ui: &impl Ui) -> bool {
+    let (first, new) = {
+        let mut phone = state.phone.lock().expect("not poisoned");
+        let new = phone.is_none();
+        (*phone.get_or_insert(peer), new)
+    };
+    if new {
+        ui.event(Event::PhoneConnected(peer));
+    }
+    first == peer
 }
 
 /// The method, target and Content-Length of a request. Refuses heads over 8 KB.
@@ -393,18 +418,23 @@ mod tests {
             offered: Mutex::default(),
             uploading: tokio::sync::Mutex::default(),
             received: Mutex::default(),
+            phone: Mutex::default(),
         };
+        let (phone, other): (IpAddr, IpAddr) = ([192, 168, 1, 30].into(), [192, 168, 1, 31].into());
         let put = |secret: &str| format!("PUT /{secret}/put/..%2F..%2Fx.bin HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
         for _ in 0..2 {
             let (request, mut response) = (put("s3cret"), Vec::new());
-            serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli).await;
+            serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli, phone).await;
             assert!(response.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&response));
         }
         assert_eq!(std::fs::read(dir.join(".._.._x.bin")).unwrap(), b"hello", "the name can't climb out");
         assert_eq!(std::fs::read(dir.join(".._.._x (1).bin")).unwrap(), b"hello", "the second copy gets a new name");
         let (request, mut response) = (put("wrong"), Vec::new());
-        serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli).await;
+        serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli, phone).await;
         assert!(response.starts_with(b"HTTP/1.1 404"));
+        let (request, mut response) = (put("s3cret"), Vec::new());
+        serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli, other).await;
+        assert!(response.starts_with(b"HTTP/1.1 403"), "the link belongs to the first phone");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "nothing else was written");
         std::fs::remove_dir_all(&dir).unwrap();
     }

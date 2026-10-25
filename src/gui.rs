@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Result;
 use slint::{Color, ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
 use tokio::sync::oneshot;
 
 use crate::{Answer, Event, Ui, count, human};
@@ -539,6 +540,10 @@ slint::slint! {
         in property <string> phone-url; // "" while the phone page's server isn't running
         in property <string> phone-offered; // names of the files the phone can download
         in property <string> phone-error;
+        in property <string> phone-peer; // the device the phone page belongs to
+        in property <bool> drop-hover; // files are being dragged over the window
+        in property <int> dropped; // dropped items waiting for a device's Toss button
+        callback drop-cancel();
         callback phone-open();
         callback phone-offer();
         callback phone-close();
@@ -688,6 +693,27 @@ slint::slint! {
                         PillButton { text: "Show in folder"; icon: Icons.folder; clicked => { root.show-saved(); } }
                     }
                     if root.progress >= 0: Bar { value: root.progress; fill: root.kind-color; }
+                }
+            }
+
+            // Items dropped on the window wait here for a device's Toss button.
+            if root.page == 0 && root.dropped > 0: Card {
+                highlight: true;
+                HorizontalLayout {
+                    padding: 14px;
+                    spacing: 12px;
+                    VerticalLayout { alignment: center; Badge { icon: Icons.up; } }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        Text { text: root.dropped == 1 ? "1 item ready" : root.dropped + " items ready"; font-size: 15px; font-weight: 700; color: Theme.text; }
+                        Text { text: root.devices.length > 0 ? "Pick a device below" : "Add a device first"; font-size: 12px; color: Theme.muted; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        PillButton { text: "Cancel"; label: "Forget the dropped items"; clicked => { root.drop-cancel(); } }
+                    }
                 }
             }
 
@@ -851,6 +877,13 @@ slint::slint! {
                         horizontal-alignment: center;
                         wrap: word-wrap;
                     }
+                    if root.phone-peer != "": Text {
+                        text: root.phone-peer;
+                        font-size: 12px;
+                        color: Theme.accent;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
                 }
             }
             if root.page == 2 && root.phone-url != "": Card {
@@ -873,6 +906,31 @@ slint::slint! {
             }
             if root.page == 2 && root.phone-error != "": Text { text: root.phone-error; color: Theme.bad; font-size: 13px; wrap: word-wrap; }
             if root.page != 0 || root.devices.length == 0: Rectangle { vertical-stretch: 1; }
+        }
+
+        // Files dragged over the window.
+        if root.drop-hover: Rectangle {
+            x: 10px;
+            y: 10px;
+            width: root.width - 20px;
+            height: root.height - 20px;
+            border-radius: 18px;
+            border-width: 2px;
+            border-color: Theme.accent;
+            background: Theme.bg-bottom.transparentize(0.08);
+            VerticalLayout {
+                alignment: center;
+                spacing: 12px;
+                HorizontalLayout { alignment: center; FileGlyph { width: 28px; height: 36px; fill: Theme.accent; } }
+                Text {
+                    text: root.page == 2 ? "Drop to offer to the phone" : "Drop to toss";
+                    font-family: Theme.display-font;
+                    font-size: 24px;
+                    font-weight: 700;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                }
+            }
         }
     }
 
@@ -905,6 +963,7 @@ struct Gui {
     transfer: Mutex<String>,                         // headline while bytes move, e.g. "Sending to laptop"
     phone: Mutex<Option<crate::phone::Share>>,       // the phone page's server, while that page is open
     saved: Mutex<Vec<PathBuf>>,                      // what the last "Received" card's buttons open
+    dropped: Mutex<Vec<PathBuf>>,                    // dragged onto the window, waiting for a device (or offered to the phone)
     inviting: Mutex<Option<tokio::task::AbortHandle>>, // the invite link that's waiting, so a new one can replace it
 }
 
@@ -922,6 +981,33 @@ impl Gui {
             w.set_act_folder(folder);
             w.set_progress(-1.0);
         });
+    }
+
+    /// One file or folder dropped on the window. On the phone page files go straight to the phone;
+    /// elsewhere they wait for a device's Toss button.
+    fn drop_in(&self, w: &AppWindow, path: PathBuf) {
+        let mut dropped = self.dropped.lock().expect("not poisoned");
+        if w.get_page() != 2 {
+            dropped.push(path);
+            w.set_dropped(dropped.len() as i32);
+            return;
+        }
+        if !path.is_file() {
+            return; // the phone page offers files, not folders
+        }
+        dropped.push(path);
+        if let Some(share) = &*self.phone.lock().expect("not poisoned") {
+            share.offer(dropped.clone());
+        }
+        let names = dropped.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+        w.set_phone_offered(listed(names).into());
+    }
+
+    /// The dropped items, if any are waiting; taking them clears the banner.
+    fn take_dropped(&self) -> Option<Vec<PathBuf>> {
+        let dropped = std::mem::take(&mut *self.dropped.lock().expect("not poisoned"));
+        self.update(|w| w.set_dropped(0));
+        (!dropped.is_empty()).then_some(dropped)
     }
 
     /// Who's at the other end of the flight arc.
@@ -1030,6 +1116,10 @@ impl Ui for Gui {
                 self.update(move |w| w.set_act_open(one_file));
             }
             Event::Declined { from } => self.show(NOTE, "Transfer declined".into(), format!("From {from}"), false),
+            Event::PhoneConnected(ip) => {
+                let peer = format!("Connected: {ip} · other devices are turned away");
+                self.update(move |w| w.set_phone_peer(peer.into()));
+            }
             Event::Failed(why) => self.show(PROBLEM, "Transfer failed".into(), why, false),
         }
     }
@@ -1102,6 +1192,7 @@ pub fn run() -> Result<()> {
         phone: Mutex::default(),
         saved: Mutex::default(),
         inviting: Mutex::default(),
+        dropped: Mutex::default(),
     });
     gui.refresh_devices();
     // Pairing or removing devices from the terminal changes contacts.json behind the window's back.
@@ -1123,8 +1214,31 @@ pub fn run() -> Result<()> {
         }
     });
 
-    win.on_send_files(sender(&gui, |dialog| dialog.pick_files()));
-    win.on_send_folder(sender(&gui, |dialog| dialog.pick_folder().map(|folder| vec![folder])));
+    let g = gui.clone();
+    win.on_send_files(sender(&gui, move || g.take_dropped().or_else(|| rfd::FileDialog::new().pick_files())));
+    win.on_send_folder(sender(&gui, || rfd::FileDialog::new().pick_folder().map(|folder| vec![folder])));
+    let g = gui.clone();
+    win.on_drop_cancel(move || drop(g.take_dropped()));
+    // Files dragged in from Explorer or Finder: winit reports each one hovering, then dropped.
+    // shortcut: Slint has no file-drop API yet, so this uses its winit hook (marked unstable), and
+    // winit 0.30 can't do drag and drop on Wayland; move over when Slint gets its own.
+    let (g, w) = (gui.clone(), win.as_weak());
+    win.window().on_winit_window_event(move |_, event| {
+        let Some(w) = w.upgrade() else { return EventResult::Propagate };
+        match event {
+            WindowEvent::HoveredFile(_) if !w.get_drop_hover() => {
+                g.dropped.lock().expect("not poisoned").clear(); // a new drag replaces what was waiting
+                w.set_drop_hover(true);
+            }
+            WindowEvent::HoveredFileCancelled => w.set_drop_hover(false),
+            WindowEvent::DroppedFile(path) => {
+                w.set_drop_hover(false);
+                g.drop_in(&w, path.clone());
+            }
+            _ => {}
+        }
+        EventResult::Propagate
+    });
     let g = gui.clone();
     win.on_open_saved(move || {
         let saved = g.saved.lock().expect("not poisoned").clone();
@@ -1215,8 +1329,10 @@ pub fn run() -> Result<()> {
         let started = crate::phone::start(g.clone());
         let shown = started.as_ref().map(|share| (share.url.clone(), qr_image(&share.url))).map_err(|e| format!("{e:#}"));
         *g.phone.lock().expect("not poisoned") = started.ok();
+        drop(g.take_dropped()); // a fresh phone page starts with nothing offered
         g.update(move |w| {
             w.set_phone_offered("".into());
+            w.set_phone_peer("".into());
             match shown {
                 Ok((url, qr)) => {
                     w.set_phone_error("".into());
@@ -1240,10 +1356,14 @@ pub fn run() -> Result<()> {
         g.update(move |w| w.set_phone_offered(names.into()));
     });
     let g = gui.clone();
-    win.on_phone_close(move || drop(g.phone.lock().expect("not poisoned").take()));
+    win.on_phone_close(move || {
+        drop(g.phone.lock().expect("not poisoned").take());
+        drop(g.take_dropped()); // files dropped for the phone mustn't wait for a Toss button
+    });
     let g = gui.clone();
     win.window().on_close_requested(move || {
         drop(g.phone.lock().expect("not poisoned").take()); // the phone link only works while its page shows
+        drop(g.take_dropped());
         g.update(|w| {
             if w.get_page() == 2 {
                 w.set_page(0);
@@ -1276,11 +1396,11 @@ fn paired(gui: &Gui, name: &str) {
     gui.update(|w| w.set_page(0));
 }
 
-/// A Send button handler: pick what to send, then send it in the background.
-fn sender(gui: &Arc<Gui>, pick: fn(rfd::FileDialog) -> Option<Vec<PathBuf>>) -> impl Fn(SharedString) + 'static {
+/// A Toss button handler: get what to send (dropped items, or a picker), then send it in the background.
+fn sender(gui: &Arc<Gui>, pick: impl Fn() -> Option<Vec<PathBuf>> + 'static) -> impl Fn(SharedString) + 'static {
     let gui = gui.clone();
     move |name| {
-        let Some(paths) = pick(rfd::FileDialog::new()) else { return };
+        let Some(paths) = pick() else { return };
         let gui = gui.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::send(&name, &paths, &*gui).await {

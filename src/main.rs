@@ -93,6 +93,7 @@ enum Event<'a> {
     Checking { bytes: u64 }, // hashing what an earlier try left before continuing; minutes on a slow disk
     Received { from: &'a str, files: usize, resumed: u64, saved: &'a [PathBuf] }, // one path per top-level item
     Declined { from: &'a str },
+    PhoneConnected(std::net::IpAddr), // the phone page now belongs to this device
     Failed(String),
 }
 
@@ -125,6 +126,7 @@ impl Ui for Cli {
                 None => println!("Received {} from {from}.", count(files)),
             },
             Event::Declined { from } => println!("Declined {from}'s files."),
+            Event::PhoneConnected(ip) => println!("Phone connected from {ip}. Other devices are turned away."),
             Event::Failed(why) => println!("Transfer failed: {why}"),
         }
     }
@@ -1126,6 +1128,14 @@ mod tests {
         assert!(relay_map(&relay("http://relay.example.com")).is_err(), "the token would travel in the clear");
         assert!(relay_map(&relay("http://127.0.0.1:3340")).is_ok(), "a relay on this computer is fine");
         assert!(relay_map(&Relay { url: "http://relay.example.com".into(), token: None }).is_ok());
+    }
+
+    #[tokio::test]
+    async fn connections_use_post_quantum_key_exchange() {
+        let (dialed, _accepted, _c, _s) = connected_pair().await;
+        let handshake = dialed.handshake_data().expect("the handshake is done");
+        let group = handshake.downcast::<noq::crypto::rustls::HandshakeData>().unwrap().negotiated_key_exchange_group;
+        assert_eq!(group, Some(rustls::NamedGroup::X25519MLKEM768));
     }
 
     #[test]
