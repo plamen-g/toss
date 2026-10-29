@@ -1,6 +1,6 @@
 [package]
 name = "toss"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Send files to your own devices and friends, peer to peer. No IP addresses, no accounts."
 license = "MIT"
@@ -15,6 +15,7 @@ icu_normalizer = "2" # already in the build through iroh; compares file names li
 iroh = { version = "1.4.1", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath"] }
 qrcodegen = "1.8"
 rfd = "0.17.2"
+rmcp = { version = "3.8", features = ["transport-io", "schemars"] } # the official MCP SDK, for `toss mcp`
 rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,6 +33,10 @@ strip = true
 [target."cfg(unix)".dependencies]
 libc = "0.2"
 
+# Shortcuts for starting at login and Explorer's "Send to" menu; already in the build through Slint.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+
 # Load fontconfig when the window needs it instead of linking it: a hard link stops toss from even
 # starting on servers without it, and needs its development files to build.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -39,3 +44,4 @@ fontique = { version = "0.11", default-features = false, features = ["fontconfig
 
 [dev-dependencies]
 noq = { version = "1.4", default-features = false } # only to read which key exchange a test connection negotiated
+rmcp = { version = "3.8", features = ["client", "transport-child-process"] } # drives `toss mcp` in tests like a real client

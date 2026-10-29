@@ -9,10 +9,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use slint::{Color, ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
-use tokio::sync::oneshot;
+use tokio::{io::AsyncReadExt, sync::oneshot};
 
 use crate::{Answer, Event, Ui, count, human};
 
@@ -383,6 +383,53 @@ slint::slint! {
         }
     }
 
+    // Where files can be dropped: a dotted outline, the usual sign for it, drawn with the flight arc's
+    // dots. Clicking it opens the picker, since people click drop zones too.
+    component DropZone inherits Rectangle {
+        in property <string> text;
+        callback clicked;
+        private property <color> dot: touch.has-hover || focus.has-focus ? Theme.accent : Theme.muted.transparentize(0.45);
+        accessible-role: button;
+        accessible-label: root.text;
+        accessible-action-default => { root.clicked(); }
+        height: 60px;
+        vertical-stretch: 0;
+
+        for i in 28: Rectangle { // top and bottom edges
+            x: 14px + (root.width - 28px) * (mod(i, 14) / 13.0) - 1.5px;
+            y: i < 14 ? 0px : root.height - 3px;
+            width: 3px;
+            height: 3px;
+            border-radius: 1.5px;
+            background: root.dot;
+        }
+        for i in 6: Rectangle { // left and right edges
+            x: i < 3 ? 0px : root.width - 3px;
+            y: 14px + (root.height - 28px) * (mod(i, 3) / 2.0) - 1.5px;
+            width: 3px;
+            height: 3px;
+            border-radius: 1.5px;
+            background: root.dot;
+        }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 10px;
+            VerticalLayout { alignment: center; FileGlyph { fill: root.dot; } }
+            Text { text: root.text; font-size: 13px; color: Theme.muted; vertical-alignment: center; }
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+        focus := FocusScope {
+            focus-on-click: false;
+            key-pressed(event) => {
+                if (event.text == " " || event.text == "\n") {
+                    root.clicked();
+                    return accept;
+                }
+                reject
+            }
+        }
+    }
+
     component Bar inherits Rectangle {
         in property <float> value;
         in property <color> fill: Theme.accent;
@@ -544,6 +591,7 @@ slint::slint! {
         in property <bool> drop-hover; // files are being dragged over the window
         in property <int> dropped; // dropped items waiting for a device's Toss button
         callback drop-cancel();
+        callback choose-files(); // the drop zone was clicked
         callback phone-open();
         callback phone-offer();
         callback phone-close();
@@ -696,6 +744,10 @@ slint::slint! {
                 }
             }
 
+            if root.page == 0 && root.devices.length > 0 && root.dropped == 0: DropZone {
+                text: "Drop files here, or click to choose";
+                clicked => { root.choose-files(); }
+            }
             // Items dropped on the window wait here for a device's Toss button.
             if root.page == 0 && root.dropped > 0: Card {
                 highlight: true;
@@ -886,7 +938,12 @@ slint::slint! {
                     }
                 }
             }
-            if root.page == 2 && root.phone-url != "": Card {
+            // As on the main page: a drop zone until something is offered, then what's offered.
+            if root.page == 2 && root.phone-url != "" && root.phone-offered == "": DropZone {
+                text: "Drop files for the phone, or click to choose";
+                clicked => { root.phone-offer(); }
+            }
+            if root.page == 2 && root.phone-url != "" && root.phone-offered != "": Card {
                 HorizontalLayout {
                     padding: 16px;
                     spacing: 12px;
@@ -896,11 +953,11 @@ slint::slint! {
                         spacing: 2px;
                         horizontal-stretch: 1;
                         Text { text: "Offered to the phone"; font-size: 15px; font-weight: 700; color: Theme.text; }
-                        Text { text: root.phone-offered != "" ? root.phone-offered : "None"; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+                        Text { text: root.phone-offered; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
                     }
                     VerticalLayout {
                         alignment: center;
-                        PillButton { text: "Choose"; label: "Choose files for the phone"; clicked => { root.phone-offer(); } }
+                        PillButton { text: "Choose"; label: "Choose other files for the phone"; clicked => { root.phone-offer(); } }
                     }
                 }
             }
@@ -938,11 +995,19 @@ slint::slint! {
     export component Tray inherits SystemTrayIcon {
         icon: @image-url("assets/icon.png");
         tooltip: "toss";
+        in property <bool> autostart;
+        in property <bool> explorer; // toss is in Explorer's "Send to" menu
+        in property <bool> windows;
         callback open();
+        callback toggle-autostart();
+        callback toggle-explorer();
         callback quit();
         clicked => { root.open(); }
+        // Slint's tray menus don't draw check marks (checked), so the title carries one.
         Menu {
             MenuItem { title: "Open toss"; activated => { root.open(); } }
+            MenuItem { title: (root.autostart ? "✓ " : "") + "Start at login"; activated => { root.toggle-autostart(); } }
+            if root.windows: MenuItem { title: (root.explorer ? "✓ " : "") + "In Explorer's Send to menu"; activated => { root.toggle-explorer(); } }
             MenuItem { title: "Quit"; activated => { root.quit(); } }
         }
     }
@@ -1001,6 +1066,25 @@ impl Gui {
         }
         let names = dropped.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
         w.set_phone_offered(listed(names).into());
+    }
+
+    /// Items picked all at once: they replace what was waiting. (Not take_dropped(): its count reset
+    /// runs later and would hide the banner these set.)
+    fn drop_all(&self, w: &AppWindow, items: Vec<PathBuf>) {
+        self.dropped.lock().expect("not poisoned").clear();
+        for item in items {
+            self.drop_in(w, item); // the same as dropping them: they wait for a device's Toss button
+        }
+    }
+
+    /// Brings the window up, from the tray or from behind other windows, with `items` (if any) waiting.
+    fn raise(&self, w: &AppWindow, items: Vec<PathBuf>) {
+        if !items.is_empty() {
+            self.drop_all(w, items);
+        }
+        let _ = w.show();
+        w.window().set_minimized(false);
+        w.window().with_winit_window(|w| w.focus_window());
     }
 
     /// The dropped items, if any are waiting; taking them clears the banner.
@@ -1171,16 +1255,18 @@ impl Ui for Gui {
     }
 }
 
-pub fn run() -> Result<()> {
+/// Opens the window with `items` waiting for a device (Explorer's "Send to"), or with
+/// `hidden`, only the tray icon (at login).
+pub fn run(items: Vec<PathBuf>, hidden: bool) -> Result<()> {
     hide_console();
     let home = crate::home()?;
     // shortcut: the probe lock is released before listen() takes it, so two copies started at the
     // same instant could both pass; harmless, the second's listen() then reports the clash.
     if crate::lock_listener(&home).is_err() {
-        rfd::MessageDialog::new()
-            .set_title("toss")
-            .set_description("toss is already running. Open it from its icon in the system tray (near the clock).")
-            .show();
+        // The toss that's running shows its window, with the items.
+        if !hidden && hand_over(&home, &items).is_err() {
+            alert("toss is already running. Open it from its icon in the system tray (near the clock).");
+        }
         return Ok(());
     }
     let win = AppWindow::new()?;
@@ -1195,6 +1281,31 @@ pub fn run() -> Result<()> {
         dropped: Mutex::default(),
     });
     gui.refresh_devices();
+    gui.drop_all(&win, items);
+
+    // Another toss started while this one runs hands over its items through this local port, with a
+    // secret only this user can read.
+    let others = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let secret = crate::hex(&iroh::SecretKey::generate().to_bytes()[..16]);
+    crate::write_private(&gui.home.join("window"), format!("{} {secret}", others.local_addr()?.port()).as_bytes())?;
+    others.set_nonblocking(true)?;
+    let others = tokio::net::TcpListener::from_std(others)?;
+    let g = gui.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = others.accept().await {
+            let mut bytes = Vec::new();
+            let read = tokio::time::timeout(std::time::Duration::from_secs(5), (&mut stream).take(1 << 20).read_to_end(&mut bytes)).await;
+            if !matches!(read, Ok(Ok(_))) {
+                continue;
+            }
+            let Ok((got, items)) = serde_json::from_slice::<(String, Vec<PathBuf>)>(&bytes) else { continue };
+            if crate::same(got.as_bytes(), secret.as_bytes()) {
+                let g2 = g.clone();
+                g.update(move |w| g2.raise(&w, items));
+            }
+        }
+    });
+
     // Pairing or removing devices from the terminal changes contacts.json behind the window's back.
     let watch = slint::Timer::default();
     let (g, mut seen) = (gui.clone(), None);
@@ -1219,6 +1330,11 @@ pub fn run() -> Result<()> {
     win.on_send_folder(sender(&gui, || rfd::FileDialog::new().pick_folder().map(|folder| vec![folder])));
     let g = gui.clone();
     win.on_drop_cancel(move || drop(g.take_dropped()));
+    let (g, w) = (gui.clone(), win.as_weak());
+    win.on_choose_files(move || {
+        let (Some(w), Some(files)) = (w.upgrade(), rfd::FileDialog::new().pick_files()) else { return };
+        g.drop_all(&w, files);
+    });
     // Files dragged in from Explorer or Finder: winit reports each one hovering, then dropped.
     // shortcut: Slint has no file-drop API yet, so this uses its winit hook (marked unstable), and
     // winit 0.30 can't do drag and drop on Wayland; move over when Slint gets its own.
@@ -1226,13 +1342,13 @@ pub fn run() -> Result<()> {
     win.window().on_winit_window_event(move |_, event| {
         let Some(w) = w.upgrade() else { return EventResult::Propagate };
         match event {
-            WindowEvent::HoveredFile(_) if !w.get_drop_hover() => {
-                g.dropped.lock().expect("not poisoned").clear(); // a new drag replaces what was waiting
-                w.set_drop_hover(true);
-            }
+            WindowEvent::HoveredFile(_) => w.set_drop_hover(true),
             WindowEvent::HoveredFileCancelled => w.set_drop_hover(false),
             WindowEvent::DroppedFile(path) => {
-                w.set_drop_hover(false);
+                if w.get_drop_hover() {
+                    g.dropped.lock().expect("not poisoned").clear(); // a new drop replaces what was waiting; a drag that leaves doesn't
+                    w.set_drop_hover(false);
+                }
                 g.drop_in(&w, path.clone());
             }
             _ => {}
@@ -1380,14 +1496,55 @@ pub fn run() -> Result<()> {
             w.window().set_minimized(false);
         }
     });
+    // Keep the login item and the Explorer entry pointing at this copy of toss, in case it moved.
+    if autostart() {
+        let _ = set_autostart(true);
+    }
+    if explorer_menu() {
+        let _ = set_explorer_menu(true);
+    }
+    tray.set_windows(cfg!(windows));
+    tray.set_autostart(autostart());
+    tray.set_explorer(explorer_menu());
+    let t = tray.as_weak();
+    tray.on_toggle_autostart(move || {
+        let Some(t) = t.upgrade() else { return };
+        if let Err(e) = set_autostart(!t.get_autostart()) {
+            alert(&format!("Couldn't change starting at login: {e:#}"));
+        }
+        t.set_autostart(autostart());
+    });
+    let t = tray.as_weak();
+    tray.on_toggle_explorer(move || {
+        let Some(t) = t.upgrade() else { return };
+        if let Err(e) = set_explorer_menu(!t.get_explorer()) {
+            alert(&format!("Couldn't change Explorer's Send to menu: {e:#}"));
+        }
+        t.set_explorer(explorer_menu());
+    });
     tray.on_quit(|| {
         let _ = slint::quit_event_loop();
     });
 
     // Closing the window only hides it (Slint's default); toss keeps receiving until Quit.
-    win.show()?;
+    if !hidden {
+        win.show()?;
+    }
     slint::run_event_loop_until_quit()?;
+    let _ = std::fs::remove_file(gui.home.join("window"));
     Ok(())
+}
+
+/// Hands items to the toss that's already running, whose window then comes up.
+fn hand_over(home: &Path, items: &[PathBuf]) -> Result<()> {
+    let text = std::fs::read_to_string(home.join("window"))?;
+    let (port, secret) = text.split_once(' ').context("bad window file")?;
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>()?))?;
+    Ok(serde_json::to_writer(stream, &(secret, items))?)
+}
+
+fn alert(text: &str) {
+    rfd::MessageDialog::new().set_title("toss").set_description(text).show();
 }
 
 fn paired(gui: &Gui, name: &str) {
@@ -1405,6 +1562,16 @@ fn sender(gui: &Arc<Gui>, pick: impl Fn() -> Option<Vec<PathBuf>> + 'static) -> 
         tokio::spawn(async move {
             if let Err(e) = crate::send(&name, &paths, &*gui).await {
                 gui.show(PROBLEM, format!("Tossing to {name} failed"), format!("{e:#}"), false);
+                // The items wait again, so Toss retries (and resumes), unless others were dropped
+                // meanwhile or the phone page, which offers what's dropped, is showing.
+                let g = gui.clone();
+                gui.update(move |w| {
+                    let mut dropped = g.dropped.lock().expect("not poisoned");
+                    if dropped.is_empty() && w.get_page() != 2 {
+                        w.set_dropped(paths.len() as i32);
+                        *dropped = paths;
+                    }
+                });
             }
         });
     }
@@ -1460,3 +1627,126 @@ fn hide_console() {
 
 #[cfg(not(windows))]
 fn hide_console() {}
+
+/// Where the system looks for programs to start at login: the Startup folder on Windows, LaunchAgents
+/// on macOS, ~/.config/autostart on desktop Linux.
+fn login_item() -> Result<PathBuf> {
+    Ok(if cfg!(windows) {
+        dirs::data_dir().context("no AppData folder")?.join(r"Microsoft\Windows\Start Menu\Programs\Startup\toss.lnk")
+    } else if cfg!(target_os = "macos") {
+        dirs::home_dir().context("no home folder")?.join("Library/LaunchAgents/com.github.plamen-g.toss.plist")
+    } else {
+        dirs::config_dir().context("no config folder")?.join("autostart/toss.desktop")
+    })
+}
+
+/// Whether toss starts in the tray when you log in.
+fn autostart() -> bool {
+    login_item().is_ok_and(|item| item.exists())
+}
+
+fn set_autostart(on: bool) -> Result<()> {
+    let item = login_item()?;
+    if !on {
+        return remove(&item);
+    }
+    std::fs::create_dir_all(item.parent().expect("inside a folder"))?;
+    write_login_item(&item)
+}
+
+#[cfg(windows)]
+fn write_login_item(item: &Path) -> Result<()> {
+    shortcut(item, "--tray")
+}
+
+/// A LaunchAgent on macOS, a desktop entry on Linux.
+#[cfg(not(windows))]
+fn write_login_item(item: &Path) -> Result<()> {
+    let exe = std::env::current_exe()?.to_str().context("toss's path isn't valid text")?.to_string();
+    let text = if cfg!(target_os = "macos") {
+        let exe = exe.replace('&', "&amp;").replace('<', "&lt;");
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.github.plamen-g.toss</string>
+  <key>ProgramArguments</key><array><string>{exe}</string><string>--tray</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+"#
+        )
+    } else {
+        // Desktop files need these escaped in layers; refuse rather than write a broken entry.
+        anyhow::ensure!(!exe.contains(['"', '`', '$', '\\', '%', '\n']), "toss's path has characters a login item can't hold");
+        format!("[Desktop Entry]\nType=Application\nName=toss\nExec=\"{exe}\" --tray\n")
+    };
+    Ok(std::fs::write(item, text)?)
+}
+
+/// Explorer's "Send to" menu lists the shortcuts in this folder, and hands a shortcut's program every
+/// selected item at once.
+#[cfg(windows)]
+fn send_to() -> Result<PathBuf> {
+    Ok(dirs::data_dir().context("no AppData folder")?.join(r"Microsoft\Windows\SendTo\toss.lnk"))
+}
+
+/// Whether Explorer's "Send to" menu lists toss.
+#[cfg(windows)]
+fn explorer_menu() -> bool {
+    send_to().is_ok_and(|item| item.exists())
+}
+
+#[cfg(windows)]
+fn set_explorer_menu(on: bool) -> Result<()> {
+    let item = send_to()?;
+    if on { shortcut(&item, "") } else { remove(&item) }
+}
+
+#[cfg(not(windows))]
+fn explorer_menu() -> bool {
+    false // the tray menu hides the option
+}
+
+#[cfg(not(windows))]
+fn set_explorer_menu(_: bool) -> Result<()> {
+    Ok(())
+}
+
+fn remove(item: &Path) -> Result<()> {
+    match std::fs::remove_file(item) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Saves a shortcut that starts this toss with `args`.
+#[cfg(windows)]
+fn shortcut(path: &Path, args: &str) -> Result<()> {
+    use windows::Win32::{
+        System::Com::{CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, IPersistFile},
+        UI::Shell::{IShellLinkW, ShellLink},
+    };
+    use windows::core::{HSTRING, Interface};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); // usually done already, for drag and drop
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+        link.SetPath(&HSTRING::from(std::env::current_exe()?.as_os_str()))?;
+        link.SetArguments(&HSTRING::from(args))?;
+        link.cast::<IPersistFile>()?.Save(&HSTRING::from(path.as_os_str()), true)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn saves_a_shortcut_with_its_arguments() {
+        let path = std::env::temp_dir().join(format!("toss-test-{}.lnk", std::process::id()));
+        super::shortcut(&path, "--tray").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(bytes[..4], [0x4c, 0, 0, 0], "a shortcut file");
+        let tray: Vec<u8> = "--tray".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(bytes.windows(tray.len()).any(|w| w == tray), "it keeps the arguments");
+    }
+}

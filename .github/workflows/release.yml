@@ -1,4 +1,5 @@
-# Push a tag like v0.1.0 and this builds toss for every platform and attaches the files to a GitHub release.
+# Push a tag like v0.1.0 and this builds toss for every platform, attaches the files to a GitHub release,
+# and publishes the MCP bundle to the MCP Registry.
 name: release
 
 on:
@@ -43,3 +44,57 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true # whichever job is first creates it
           gh release upload "$GITHUB_REF_NAME" "${{ matrix.file }}" assets/OFL-BricolageGrotesque.txt --clobber # the font's license travels with it
+
+  # One MCP bundle for every platform, for Claude Desktop and the MCP Registry: the Windows build, and
+  # the macOS and Linux ones behind a launcher that picks this machine's (the bundle format can only
+  # pick by OS, not by CPU). Runs once every build is attached, so it never publishes a partial bundle.
+  mcp:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # attach the bundle to the release
+      id-token: write # the registry trusts this repository's GitHub identity: no token to keep or leak
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.6
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          # The registry keeps every version for good, so a tag that disagrees with the code stops here.
+          grep -q "^version = \"$version\"" Cargo.toml || { echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml"; exit 1; }
+          gh release download "$GITHUB_REF_NAME" --pattern 'toss-*' --dir dl
+          mkdir -p bundle/server
+          cp dl/toss-windows-x86_64.exe bundle/server/toss.exe
+          for build in macos-arm64:Darwin-arm64 macos-x86_64:Darwin-x86_64 linux-x86_64:Linux-x86_64 linux-arm64:Linux-aarch64; do
+            tar xzf "dl/toss-${build%%:*}.tar.gz" -C dl
+            mv dl/toss "bundle/server/toss-${build##*:}" # named as `uname -s`-`uname -m` print, for the launcher
+          done
+          cp mcpb/toss bundle/server/toss
+          cp assets/icon.png LICENSE assets/OFL-BricolageGrotesque.txt bundle/ # the licenses travel with the binaries
+          jq --arg v "$version" '.version = $v' mcpb/manifest.json > bundle/manifest.json
+          chmod +x bundle/server/*
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack bundle toss.mcpb # packed on Linux, so the files stay executable
+          gh release upload "$GITHUB_REF_NAME" toss.mcpb --clobber
+          jq --arg v "$version" --arg sha "$(sha256sum toss.mcpb | cut -d' ' -f1)" \
+            --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/toss.mcpb" \
+            '.version = $v | .packages[0].identifier = $url | .packages[0].fileSha256 = $sha' server.json > server.tmp
+          mv server.tmp server.json
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: publish to the MCP Registry
+        run: |
+          set -euo pipefail
+          archive=mcp-publisher_linux_amd64.tar.gz
+          base=https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION
+          curl -fsSL -o "$archive" "$base/$archive"
+          curl -fsSL -o "$archive.sigstore.json" "$base/$archive.sigstore.json"
+          # Only run a publisher that the registry's own release workflow signed.
+          cosign verify-blob --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/$MCP_PUBLISHER_VERSION" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$archive"
+          tar xzf "$archive" mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

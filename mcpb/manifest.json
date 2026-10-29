@@ -1,0 +1,41 @@
+{
+  "manifest_version": "0.3",
+  "name": "toss",
+  "display_name": "toss",
+  "version": "0.2.0",
+  "description": "Send files to your own devices and friends, peer to peer and end-to-end encrypted.",
+  "long_description": "toss sends files straight between devices: no accounts, no cloud storage, end-to-end encrypted with a post-quantum key exchange. With this extension Claude can list your paired devices and send them files, and nothing else: pairing, removing devices and settings stay with you.\n\nPair your devices first with the toss app ([download](https://github.com/plamen-g/toss/releases)). Someone on the other device still accepts each transfer, unless it takes files from yours without asking.",
+  "author": {
+    "name": "plamen-g",
+    "url": "https://github.com/plamen-g"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/plamen-g/toss"
+  },
+  "homepage": "https://github.com/plamen-g/toss",
+  "documentation": "https://github.com/plamen-g/toss#ai-assistants-mcp",
+  "support": "https://github.com/plamen-g/toss/issues",
+  "icon": "icon.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/toss",
+    "mcp_config": {
+      "command": "${__dirname}/server/toss",
+      "args": ["mcp"],
+      "platform_overrides": {
+        "win32": { "command": "${__dirname}/server/toss.exe" }
+      }
+    }
+  },
+  "tools": [
+    { "name": "list_devices", "description": "List the devices paired with toss." },
+    { "name": "send_files", "description": "Send files or folders to a paired device, end-to-end encrypted." }
+  ],
+  "keywords": ["file transfer", "send files", "peer to peer", "encrypted", "airdrop"],
+  "license": "MIT",
+  "privacy_policies": ["https://github.com/plamen-g/toss#privacy"],
+  "compatibility": {
+    "platforms": ["win32", "darwin", "linux"]
+  }
+}

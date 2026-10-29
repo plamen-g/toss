@@ -2,10 +2,11 @@
 //! Devices are known by public key (iroh), never by IP address.
 
 mod gui;
+mod mcp;
 mod phone;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     io::{IsTerminal as _, Write as _},
     path::{Component, Path, PathBuf},
@@ -37,6 +38,7 @@ const NO_SPACE: u8 = 2;
 
 const USAGE: &str = "usage:
   toss                        open the window
+  toss <path>...              open the window with these waiting for a device
   toss invite <name>          print an invite link (<name> is what you'll call them)
   toss join <link> <name>     accept an invite link (<name> is what you'll call them)
   toss contacts               list contacts
@@ -46,14 +48,17 @@ const USAGE: &str = "usage:
   toss phone [file]...        a QR code for a phone on your network: it downloads these files,
                               or sends files here, in its browser
   toss relay <url> [token]    use your own relay server; every device you send to needs the same
-  toss relay off              back to the free public relays";
+  toss relay off              back to the free public relays
+  toss mcp                    let an AI assistant list your devices and send them files (an MCP
+                              server on stdin/stdout, which the assistant starts)";
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let res = match args.as_slice() {
-        [] => gui::run(),
+        [] => gui::run(vec![], false),
+        ["--tray"] => gui::run(vec![], true), // started at login
         ["invite", name] => cli_invite(name).await,
         ["join", link, name] => join(link, name).await.map(|()| println!("Paired with {name}.")),
         ["contacts"] => list(),
@@ -61,10 +66,15 @@ async fn main() {
         ["send", name, paths @ ..] if !paths.is_empty() => send(name, paths, &Cli).await,
         ["listen"] => listen(Arc::new(Cli)).await,
         ["phone", files @ ..] => phone::cli(files).await,
+        ["mcp"] => mcp::serve().await,
         ["relay"] => show_relay(),
         ["relay", "off"] => set_relay(None),
         ["relay", url, token @ ..] if token.len() <= 1 => {
             set_relay(Some(Relay { url: url.to_string(), token: token.first().map(|t| t.to_string()) }))
+        }
+        // Explorer's "Send to", or files dropped on toss itself.
+        _ if args.iter().all(|p| Path::new(p).exists()) => {
+            args.iter().map(std::path::absolute).collect::<std::io::Result<_>>().map_err(Into::into).and_then(|items| gui::run(items, false))
         }
         _ => {
             eprintln!("{USAGE}");
@@ -105,30 +115,37 @@ trait Ui: Sync {
     fn accept(&self, from: &str, files: &[(String, u64)], gone: impl Future<Output = ()> + Send) -> impl Future<Output = Answer> + Send;
 }
 
-struct Cli;
-
-impl Ui for Cli {
-    fn event(&self, event: Event) {
-        match event {
-            Event::Ready(dir) => println!("Ready to receive. Files go to {}.", dir.display()),
-            Event::Waiting { to, .. } => println!("Waiting for {to} to accept..."),
-            Event::Sending { to, files } => println!("Sending {} to {to}...", count(files)),
+impl Event<'_> {
+    /// The event in words, as the terminal and an AI assistant get it (the window has its own cards).
+    fn line(&self) -> String {
+        match *self {
+            Event::Ready(dir) => format!("Ready to receive. Files go to {}.", dir.display()),
+            Event::Waiting { to, .. } => format!("Waiting for {to} to accept..."),
+            Event::Sending { to, files } => format!("Sending {} to {to}...", count(files)),
             Event::Sent { to, files, direct, mb_per_s, resumed } => {
                 let mut notes = vec![if direct { "direct" } else { "via relay" }.to_string()];
                 notes.extend(mb_per_s.map(|s| format!("{s:.1} MB/s")));
                 notes.extend(continued(resumed));
-                println!("Sent {} to {to} ({}).", count(files), notes.join(", "));
+                format!("Sent {} to {to} ({}).", count(files), notes.join(", "))
             }
-            Event::Receiving { from, files } => println!("Receiving {} from {from}...", count(files)),
-            Event::Checking { bytes } => println!("Checking {} from an earlier try...", human(bytes)),
+            Event::Receiving { from, files } => format!("Receiving {} from {from}...", count(files)),
+            Event::Checking { bytes } => format!("Checking {} from an earlier try...", human(bytes)),
             Event::Received { from, files, resumed, .. } => match continued(resumed) {
-                Some(note) => println!("Received {} from {from} ({note}).", count(files)),
-                None => println!("Received {} from {from}.", count(files)),
+                Some(note) => format!("Received {} from {from} ({note}).", count(files)),
+                None => format!("Received {} from {from}.", count(files)),
             },
-            Event::Declined { from } => println!("Declined {from}'s files."),
-            Event::PhoneConnected(ip) => println!("Phone connected from {ip}. Other devices are turned away."),
-            Event::Failed(why) => println!("Transfer failed: {why}"),
+            Event::Declined { from } => format!("Declined {from}'s files."),
+            Event::PhoneConnected(ip) => format!("Phone connected from {ip}. Other devices are turned away."),
+            Event::Failed(ref why) => format!("Transfer failed: {why}"),
         }
+    }
+}
+
+struct Cli;
+
+impl Ui for Cli {
+    fn event(&self, event: Event) {
+        println!("{}", event.line());
     }
 
     fn progress(&self, done: u64, total: u64) {
@@ -335,7 +352,9 @@ async fn send(name: &str, paths: &[impl AsRef<Path>], ui: &impl Ui) -> Result<()
             continue; // they have all of it
         }
         let mut file = tokio::fs::File::open(path).await?;
-        file.seek(std::io::SeekFrom::Start(*start)).await?;
+        if *start > 0 {
+            file.seek(std::io::SeekFrom::Start(*start)).await?;
+        }
         copy_exact(file, &mut tx, size - start, &mut progress)
             .await
             .with_context(|| format!("sending {}", path.display()))?;
@@ -347,8 +366,9 @@ async fn send(name: &str, paths: &[impl AsRef<Path>], ui: &impl Ui) -> Result<()
     // Under 1 MB the time is mostly setup, so a speed would mislead.
     let moved = total - resumed;
     let mb_per_s = (moved >= 1_000_000).then(|| mb(moved) / started.elapsed().as_secs_f64());
-    ep.close().await;
+    // Say so before closing: a graceful close can take another second, and the files are already confirmed.
     ui.event(Event::Sent { to: name, files: files.len(), direct, mb_per_s, resumed });
+    ep.close().await;
     Ok(())
 }
 
@@ -492,6 +512,9 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui
     let resumed: u64 = starts.iter().sum();
     let mut progress = Progress::new(ui, total);
     progress.done = resumed;
+    for dir in staged.iter().filter_map(|path| path.parent()).collect::<BTreeSet<_>>() {
+        tokio::fs::create_dir_all(dir).await?; // each folder once, not once per file
+    }
     for ((path, (_, size)), start) in staged.iter().zip(&files).zip(&starts) {
         receive_file(&mut rx, path, *start, *size, &mut progress).await?;
     }
@@ -522,14 +545,17 @@ async fn receive_file(
     if start == size && tokio::fs::try_exists(staged).await? {
         return Ok(()); // finished on an earlier try, and the sender confirmed it's the same
     }
-    if let Some(dir) = staged.parent() {
-        tokio::fs::create_dir_all(dir).await?;
-    }
     let _ = tokio::fs::remove_file(staged).await; // an older finished copy that no longer matches
     let part = part_of(staged);
-    let mut file = tokio::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&part).await?;
-    file.set_len(start).await?; // drop anything past what the sender confirmed
-    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut file = if start == 0 {
+        tokio::fs::File::create(&part).await?
+    } else {
+        // The part must still be there: creating it afresh would put zeros where the confirmed bytes were.
+        let mut file = tokio::fs::OpenOptions::new().write(true).open(&part).await?;
+        file.set_len(start).await?; // drop anything past what the sender confirmed
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        file
+    };
     copy_exact(&mut *rx, &mut file, size - start, p).await?;
     file.flush().await?;
     drop(file); // Windows can't rename an open file
@@ -766,6 +792,10 @@ async fn bind(key: SecretKey, alpns: &[&[u8]]) -> Result<Endpoint> {
         .secret_key(key)
         .alpns(alpns.iter().map(|a| a.to_vec()).collect())
         .portmapper_config(PortmapperConfig::Disabled) // UPnP probing can trigger firewall prompts
+        // shortcut: QUIC's default 1.25 MB stream window caps a transfer (one stream) at 1.25 MB per
+        // round trip, 12.5 MB/s at 100 ms. A bigger window trips noq 1.4's limit of 1024 gaps per
+        // stream under load (seen with 2000 small files), so faster long-distance transfers need
+        // several streams per transfer instead.
         .bind()
         .await?)
 }
@@ -1036,6 +1066,27 @@ mod tests {
         assert!(verify(&other, &hello, DIALER).is_err(), "replay on another connection must fail");
     }
 
+    #[tokio::test]
+    async fn strangers_are_turned_away_before_their_file_list() {
+        let home = std::env::temp_dir().join(format!("toss-stranger-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap(); // no contacts: everyone is a stranger
+        let server = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+        let client = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let port = server.bound_sockets().iter().find(|s| s.is_ipv4()).unwrap().port();
+        let addr = iroh::EndpointAddr::new(server.id()).with_ip_addr(([127, 0, 0, 1], port).into());
+        let receiving = tokio::spawn({
+            let home = home.clone();
+            async move { receive(server.accept().await.unwrap(), &home, &home, &Cli, &Turns::default()).await }
+        });
+        let conn = client.connect(addr, ALPN).await.unwrap();
+        let (mut tx, _rx) = conn.open_bi().await.unwrap();
+        send_msg(&mut tx, &introduce(&conn, &SecretKey::generate(), DIALER).unwrap()).await.unwrap();
+        // ...and no file list follows: a receiver that waited for one first would sit here for 30 s.
+        let refused = tokio::time::timeout(Duration::from_secs(5), receiving).await.expect("turned away at once").unwrap();
+        assert!(refused.unwrap_err().to_string().contains("isn't a contact"));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
     #[test]
     fn never_overwrites_or_collides() {
         let dl = Path::new("dl");
@@ -1095,6 +1146,9 @@ mod tests {
         assert!(std::fs::read_to_string(format!("{}:Zone.Identifier", staged.display())).unwrap().contains("ZoneId=3"));
         receive_file(&mut &b""[..], &staged, 10, 10, &mut progress).await.unwrap();
         assert_eq!(std::fs::read(&staged).unwrap(), b"hello12345", "a confirmed finished file is left alone");
+        let gone = dir.join("gone.bin"); // its partial vanished after it was checked
+        assert!(receive_file(&mut &b"rest"[..], &gone, 4, 8, &mut progress).await.is_err());
+        assert!(!part_of(&gone).exists(), "no file starting with zeros where the confirmed bytes were");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

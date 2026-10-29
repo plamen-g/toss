@@ -27,11 +27,12 @@ pub struct Share {
 
 struct State {
     secret: String,
+    key: String, // the cookie only the first browser to open the link gets, never in the link itself
     downloads: PathBuf,
     offered: Mutex<Vec<PathBuf>>,
     uploading: tokio::sync::Mutex<()>, // one at a time, so two uploads can't pick the same free name
     received: Mutex<Vec<PathBuf>>,     // everything this page has received, so a batch reads as one
-    phone: Mutex<Option<IpAddr>>,      // the first device to use the link; anyone else holding it is turned away
+    phone: Mutex<Option<IpAddr>>,      // the address of the browser that got the key
 }
 
 impl Share {
@@ -55,6 +56,7 @@ pub fn start<U: Ui + Send + 'static>(ui: Arc<U>) -> Result<Share> {
     let url = format!("http://{}/{secret}", listener.local_addr()?);
     let state = Arc::new(State {
         secret,
+        key: hex(&SecretKey::generate().to_bytes()[..16]),
         downloads: crate::downloads_dir()?,
         offered: Mutex::default(),
         uploading: tokio::sync::Mutex::default(),
@@ -131,14 +133,12 @@ async fn serve(
     peer: IpAddr,
 ) {
     // Anyone on the network can connect: give up on silent or oversized requests.
-    let Ok(Ok((method, target, len))) = tokio::time::timeout(Duration::from_secs(10), request(r)).await else { return };
+    let Ok(Ok((method, target, len, cookie))) = tokio::time::timeout(Duration::from_secs(10), request(r)).await else { return };
     let mut parts = target.split('?').next().unwrap_or_default().trim_start_matches('/').splitn(3, '/');
+    let key = format!("toss={}", state.key);
     let res = if !parts.next().is_some_and(|s| same(s.as_bytes(), state.secret.as_bytes())) {
         reply(w, "404 Not Found", TEXT, b"Not found").await
-    } else if !claim(state, peer, ui) {
-        let text = b"This page is already open on another device. Open Phone again on the computer for a new code.";
-        reply(w, "403 Forbidden", TEXT, text).await
-    } else {
+    } else if cookie.split(';').any(|c| same(c.trim().as_bytes(), key.as_bytes())) && *state.phone.lock().expect("not poisoned") == Some(peer) {
         match (method.as_str(), parts.next(), parts.next()) {
             ("GET", None | Some(""), None) => reply(w, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()).await,
             ("GET", Some("list"), None) => list(w, state).await,
@@ -146,28 +146,33 @@ async fn serve(
             ("PUT", Some("put"), Some(name)) => upload(r, w, state, name, len, ui).await,
             _ => reply(w, "404 Not Found", TEXT, b"Not found").await,
         }
+    } else if claim(state, peer, ui) {
+        let extra = format!("Set-Cookie: {key}; Path=/; HttpOnly; SameSite=Lax\r\nLocation: /{}\r\n", state.secret);
+        head(w, "303 See Other", TEXT, 0, &extra).await // back to the page, now with the key
+    } else {
+        let text = b"This page is already open on another device or browser. Open Phone again on the computer for a new code.";
+        reply(w, "403 Forbidden", TEXT, text).await
     };
     if let Err(e) = res {
         ui.event(Event::Failed(format!("phone: {e:#}")));
     }
 }
 
-/// The first device to use the link gets the page. Anyone else holding it, from a sniffed or
-/// photographed code, is turned away.
+/// Whether this is the first browser to use the link, which then gets the key. Anyone else holding the
+/// link, from a sniffed or photographed code or from another device behind the same router (one
+/// address for all of them), is turned away.
 fn claim(state: &State, peer: IpAddr, ui: &impl Ui) -> bool {
-    let (first, new) = {
-        let mut phone = state.phone.lock().expect("not poisoned");
-        let new = phone.is_none();
-        (*phone.get_or_insert(peer), new)
-    };
-    if new {
-        ui.event(Event::PhoneConnected(peer));
+    let mut phone = state.phone.lock().expect("not poisoned");
+    if phone.is_some() {
+        return false;
     }
-    first == peer
+    *phone = Some(peer);
+    ui.event(Event::PhoneConnected(peer));
+    true
 }
 
-/// The method, target and Content-Length of a request. Refuses heads over 8 KB.
-async fn request(r: &mut (impl AsyncBufRead + Unpin)) -> Result<(String, String, Option<u64>)> {
+/// The method, target, Content-Length and cookies of a request. Refuses heads over 8 KB.
+async fn request(r: &mut (impl AsyncBufRead + Unpin)) -> Result<(String, String, Option<u64>, String)> {
     let mut lines = Vec::new();
     let mut size = 0;
     loop {
@@ -181,16 +186,17 @@ async fn request(r: &mut (impl AsyncBufRead + Unpin)) -> Result<(String, String,
     }
     let mut first = lines.first().context("empty request")?.split(' ');
     let (method, target) = (first.next().unwrap_or_default().to_string(), first.next().context("no target")?.to_string());
-    let mut len = None;
+    let (mut len, mut cookie) = (None, String::new());
     for line in &lines[1..] {
         let (key, value) = line.split_once(':').context("bad header")?;
         match key.trim().to_ascii_lowercase().as_str() {
             "content-length" => len = Some(value.trim().parse()?),
+            "cookie" => cookie = value.trim().to_string(),
             "transfer-encoding" => bail!("chunked uploads aren't supported"), // browsers send a length for files
             _ => {}
         }
     }
-    Ok((method, target, len))
+    Ok((method, target, len, cookie))
 }
 
 async fn head(w: &mut (impl AsyncWrite + Unpin), status: &str, kind: &str, len: u64, extra: &str) -> Result<()> {
@@ -399,9 +405,9 @@ mod tests {
 
     #[tokio::test]
     async fn reads_a_request_head_and_refuses_junk() {
-        let req = b"PUT /s/put/a.jpg HTTP/1.1\r\nHost: x\r\nContent-Length: 12\r\n\r\nbody";
-        let (method, target, len) = request(&mut &req[..]).await.unwrap();
-        assert_eq!((method.as_str(), target.as_str(), len), ("PUT", "/s/put/a.jpg", Some(12)));
+        let req = b"PUT /s/put/a.jpg HTTP/1.1\r\nHost: x\r\nCookie: a=1; toss=k\r\nContent-Length: 12\r\n\r\nbody";
+        let (method, target, len, cookie) = request(&mut &req[..]).await.unwrap();
+        assert_eq!((method.as_str(), target.as_str(), len, cookie.as_str()), ("PUT", "/s/put/a.jpg", Some(12), "a=1; toss=k"));
         assert!(request(&mut &b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"[..]).await.is_err());
         assert!(request(&mut &b"GET / HTTP/1.1\r\nHost: x"[..]).await.is_err(), "cut off");
         let huge = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(9000));
@@ -414,27 +420,34 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = State {
             secret: "s3cret".into(),
+            key: "k3y".into(),
             downloads: dir.clone(),
             offered: Mutex::default(),
             uploading: tokio::sync::Mutex::default(),
             received: Mutex::default(),
             phone: Mutex::default(),
         };
+        let ask = async |request: String, from| {
+            let mut response = Vec::new();
+            serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli, from).await;
+            String::from_utf8(response).unwrap()
+        };
         let (phone, other): (IpAddr, IpAddr) = ([192, 168, 1, 30].into(), [192, 168, 1, 31].into());
-        let put = |secret: &str| format!("PUT /{secret}/put/..%2F..%2Fx.bin HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+        let opened = ask("GET /s3cret HTTP/1.1\r\n\r\n".into(), phone).await;
+        assert!(opened.starts_with("HTTP/1.1 303") && opened.contains("Set-Cookie: toss=k3y;"), "{opened}");
+        let put = |secret: &str, cookie: &str| {
+            format!("PUT /{secret}/put/..%2F..%2Fx.bin HTTP/1.1\r\nCookie: {cookie}\r\nContent-Length: 5\r\n\r\nhello")
+        };
         for _ in 0..2 {
-            let (request, mut response) = (put("s3cret"), Vec::new());
-            serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli, phone).await;
-            assert!(response.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&response));
+            let response = ask(put("s3cret", "toss=k3y"), phone).await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         }
         assert_eq!(std::fs::read(dir.join(".._.._x.bin")).unwrap(), b"hello", "the name can't climb out");
         assert_eq!(std::fs::read(dir.join(".._.._x (1).bin")).unwrap(), b"hello", "the second copy gets a new name");
-        let (request, mut response) = (put("wrong"), Vec::new());
-        serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli, phone).await;
-        assert!(response.starts_with(b"HTTP/1.1 404"));
-        let (request, mut response) = (put("s3cret"), Vec::new());
-        serve(&mut request.as_bytes(), &mut response, &state, &crate::Cli, other).await;
-        assert!(response.starts_with(b"HTTP/1.1 403"), "the link belongs to the first phone");
+        assert!(ask(put("wrong", "toss=k3y"), phone).await.starts_with("HTTP/1.1 404"));
+        let neighbor = ask(put("s3cret", ""), phone).await;
+        assert!(neighbor.starts_with("HTTP/1.1 403"), "another device behind the same router has the address, not the key");
+        assert!(ask(put("s3cret", "toss=k3y"), other).await.starts_with("HTTP/1.1 403"), "a sniffed key from elsewhere");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "nothing else was written");
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.plamen-g/toss",
+  "title": "toss",
+  "description": "Send files to your own devices and friends, peer to peer and end-to-end encrypted.",
+  "repository": {
+    "url": "https://github.com/plamen-g/toss",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/plamen-g/toss",
+  "version": "0.2.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/plamen-g/toss/releases/download/v0.2.0/toss.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
