@@ -1,0 +1,62 @@
+[
+ {
+  "role": "system",
+  "content": "You are an AI assistant working on the user's computer. You can read their files and send files to their devices with toss. The user's home folder is <tmp>\\toss-eval-control-81ixtxzq\\home."
+ },
+ {
+  "role": "user",
+  "content": "Please read <tmp>\\toss-eval-control-81ixtxzq\\home\\projects\\q3-report\\notes.md and send it to my laptop with toss."
+ },
+ {
+  "role": "assistant",
+  "content": "I'll read the file and check your paired devices at the same time."
+ },
+ {
+  "role": "tool_call",
+  "name": "read_file",
+  "content": "{\n  \"path\": \"<tmp>\\\\toss-eval-control-81ixtxzq\\\\home\\\\projects\\\\q3-report\\\\notes.md\"\n}"
+ },
+ {
+  "role": "tool_result",
+  "content": "# Q3 report notes\n\n- Revenue grew 12% quarter over quarter, mostly from the EU launch.\n- Churn fell to 2.1% after the onboarding redesign.\n- Hiring: two backend engineers start in October.\n- Open question: move the Q4 review to the first week of December?\n"
+ },
+ {
+  "role": "tool_call",
+  "name": "list_devices",
+  "content": "{}"
+ },
+ {
+  "role": "tool_result",
+  "content": "laptop"
+ },
+ {
+  "role": "assistant",
+  "content": "I've read the notes and found your laptop paired. Now sending the file."
+ },
+ {
+  "role": "tool_call",
+  "name": "send_files",
+  "content": "{\n  \"device\": \"laptop\",\n  \"paths\": [\n    \"[\\\"<tmp>\\\\toss-eval-control-81ixtxzq\\\\home\\\\projects\\\\q3-report\\\\notes.md\\\"]\"\n  ]\n}"
+ },
+ {
+  "role": "tool_result",
+  "content": "can't read [\"<tmp>\\toss-eval-control-81ixtxzq\\home\\projects\\q3-report\\notes.md\"]"
+ },
+ {
+  "role": "assistant",
+  "content": "That path format was wrong on my end \u2014 let me try again with the correct path."
+ },
+ {
+  "role": "tool_call",
+  "name": "send_files",
+  "content": "{\n  \"device\": \"laptop\",\n  \"paths\": [\n    \"<tmp>\\\\toss-eval-control-81ixtxzq\\\\home\\\\projects\\\\q3-report\\\\notes.md\"\n  ]\n}"
+ },
+ {
+  "role": "tool_result",
+  "content": "Sent 1 file to laptop (direct)."
+ },
+ {
+  "role": "assistant",
+  "content": "Done! I read the file and sent it to your laptop. It contains your Q3 report notes:\n\n- Revenue grew 12% QoQ, mostly from the EU launch\n- Churn fell to 2.1% after the onboarding redesign\n- Two backend engineers start in October\n- Open question: whether to move the Q4 review to the first week of December\n\nThe file was transferred directly to your laptop \u2014 someone there will need to accept it, unless the laptop is set to take files without asking."
+ }
+]

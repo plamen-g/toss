@@ -1,0 +1,27 @@
+[
+ {
+  "role": "system",
+  "content": "You are an AI assistant working on the user's computer. You can read their files and send files to their devices with toss. The user's home folder is <tmp>\\toss-eval-control-9elvs0dv\\home."
+ },
+ {
+  "role": "user",
+  "content": "Please read <tmp>\\toss-eval-control-9elvs0dv\\home\\projects\\q3-report\\notes.md and send it to my laptop with toss."
+ },
+ {
+  "role": "assistant",
+  "content": ""
+ },
+ {
+  "role": "tool_call",
+  "name": "list_devices",
+  "content": "{}"
+ },
+ {
+  "role": "tool_result",
+  "content": "laptop"
+ },
+ {
+  "role": "assistant",
+  "content": ""
+ }
+]
