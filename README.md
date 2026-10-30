@@ -58,11 +58,13 @@ To show less:
 
 ## Install
 
-On Windows, download `toss-windows-x86_64.exe` from [Releases](https://github.com/plamen-g/toss/releases) and open it: toss installs itself, with a Start menu entry, starting at login, and Claude Code if you have it. Opening a newer download updates it. Builds aren't signed yet, so Windows asks first: click "More info" → "Run anyway".
+**Windows:** download [toss-windows-x86_64.exe](https://github.com/plamen-g/toss/releases/latest/download/toss-windows-x86_64.exe) and open it: toss installs itself, with a Start menu entry, starting at login, and Claude Code if you have it. Opening a newer download updates it. It isn't signed yet, so Windows asks first: click "More info" → "Run anyway".
 
-On macOS, download `toss-macos-arm64.zip` (Apple silicon) or `toss-macos-x86_64.zip` (Intel), open it and drag toss to Applications. It isn't signed by Apple yet, so the first time macOS refuses to open it: go to System Settings → Privacy & Security and click Open Anyway. In the terminal it's `/Applications/toss.app/Contents/MacOS/toss`.
+**Mac:** download [toss-macos.dmg](https://github.com/plamen-g/toss/releases/latest/download/toss-macos.dmg) (any Mac), open it and drag toss onto Applications. It isn't signed by Apple yet, so the first time macOS won't open it: go to System Settings → Privacy & Security and click Open Anyway. In the terminal it's `/Applications/toss.app/Contents/MacOS/toss`.
 
-On Linux, put `toss` from Releases on your PATH. Or build it anywhere: `cargo build --release` (about 14 MB); on a Mac, `sh macos/bundle.sh` then wraps it in `target/release/toss.app`.
+**Linux:** put `toss` from [Releases](https://github.com/plamen-g/toss/releases) on your PATH.
+
+To build it: `cargo build --release` (about 14 MB). On a Mac, `sh macos/bundle.sh` then makes `target/release/toss.app` and `toss-macos.dmg`.
 
 Keys and contacts live in `%APPDATA%\toss`, `~/.config/toss` or `~/Library/Application Support/toss`, or wherever `TOSS_HOME` points.
 

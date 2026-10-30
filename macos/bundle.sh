@@ -1,7 +1,8 @@
 #!/bin/sh
 # Wraps a built toss in toss.app, so macOS lists it in Applications and Launchpad and shows its icon in
-# the Dock. Run it on a Mac, from the repository: sh macos/bundle.sh [binary] [folder]
-# (by default target/release/toss, into target/release). Then drag toss.app to Applications.
+# the Dock, and puts that in toss-macos.dmg: open it and drag toss onto the Applications folder beside it.
+# Run it on a Mac, from the repository: sh macos/bundle.sh [binary] [folder]
+# (by default target/release/toss, into target/release).
 set -eu
 bin=${1:-target/release/toss}
 out=${2:-target/release}
@@ -43,4 +44,11 @@ EOF
 
 # Apple silicon runs only signed code. Ad hoc, since toss isn't signed with an Apple developer ID yet.
 codesign --force --sign - "$app"
+
+# The disk image: the app, and a shortcut to Applications to drag it onto.
+stage=$(mktemp -d)
+ditto "$app" "$stage/toss.app"
+ln -s /Applications "$stage/Applications"
+hdiutil create -volname toss -srcfolder "$stage" -ov -format UDZO "$out/toss-macos.dmg" >/dev/null
 echo "$app"
+echo "$out/toss-macos.dmg"

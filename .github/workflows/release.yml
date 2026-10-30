@@ -44,19 +44,27 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true # whichever job is first creates it
           gh release upload "$GITHUB_REF_NAME" "${{ matrix.file }}" assets/OFL-BricolageGrotesque.txt --clobber # the font's license travels with it
-      # On a Mac, also toss.app in a zip: for Applications, Launchpad and the Dock. (The .tar.gz stays, for the
-      # terminal and the MCP bundle.)
-      - name: mac app
-        if: runner.os == 'macOS'
-        shell: bash
+
+  # One Mac download for every Mac: both builds in one program, as toss.app in toss-macos.dmg. (The .tar.gz
+  # files stay, for the terminal and the MCP bundle.)
+  mac:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: disk image
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sh macos/bundle.sh "target/${{ matrix.target }}/release/toss" dist
-          zip="${{ matrix.file }}"
-          zip="${zip%.tar.gz}.zip"
-          ditto -c -k --keepParent dist/toss.app "$zip"
-          gh release upload "$GITHUB_REF_NAME" "$zip" --clobber
+          set -euo pipefail
+          gh release download "$GITHUB_REF_NAME" --pattern 'toss-macos-*.tar.gz' --dir dl
+          for arch in arm64 x86_64; do
+            mkdir -p "dl/$arch"
+            tar xzf "dl/toss-macos-$arch.tar.gz" -C "dl/$arch"
+          done
+          lipo -create -output dl/toss dl/arm64/toss dl/x86_64/toss
+          sh macos/bundle.sh dl/toss dist
+          gh release upload "$GITHUB_REF_NAME" dist/toss-macos.dmg --clobber
 
   # mcpb's check of the bundle's manifest. Its npm dependencies aren't pinned, so it runs here, where it
   # can't touch the release or publish, and never where the bundle is made.
