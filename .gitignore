@@ -1,1 +1,5 @@
 /target
+# wiring checks and the generated report of the injection test
+/evals/injection/checks/
+/evals/injection/report.html
+/evals/injection/trajectory/

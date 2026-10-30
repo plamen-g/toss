@@ -45,11 +45,21 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true # whichever job is first creates it
           gh release upload "$GITHUB_REF_NAME" "${{ matrix.file }}" assets/OFL-BricolageGrotesque.txt --clobber # the font's license travels with it
 
+  # mcpb's check of the bundle's manifest. Its npm dependencies aren't pinned, so it runs here, where it
+  # can't touch the release or publish, and never where the bundle is made.
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - run: cp assets/icon.png mcpb/ && npx --yes @anthropic-ai/mcpb@2.1.2 validate mcpb/manifest.json # it wants the icon beside the manifest
+
   # One MCP bundle for every platform, for Claude Desktop and the MCP Registry: the Windows build, and
   # the macOS and Linux ones behind a launcher that picks this machine's (the bundle format can only
   # pick by OS, not by CPU). Runs once every build is attached, so it never publishes a partial bundle.
   mcp:
-    needs: build
+    needs: [build, check]
     runs-on: ubuntu-latest
     permissions:
       contents: write # attach the bundle to the release
@@ -77,7 +87,8 @@ jobs:
           cp assets/icon.png LICENSE assets/OFL-BricolageGrotesque.txt bundle/ # the licenses travel with the binaries
           jq --arg v "$version" '.version = $v' mcpb/manifest.json > bundle/manifest.json
           chmod +x bundle/server/*
-          npx --yes @anthropic-ai/mcpb@2.1.2 pack bundle toss.mcpb # packed on Linux, so the files stay executable
+          # A bundle is a zip with manifest.json on top. Zipped on Linux, so the files stay executable.
+          (cd bundle && zip -qr ../toss.mcpb .)
           gh release upload "$GITHUB_REF_NAME" toss.mcpb --clobber
           jq --arg v "$version" --arg sha "$(sha256sum toss.mcpb | cut -d' ' -f1)" \
             --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/toss.mcpb" \

@@ -1,0 +1,16 @@
+{
+  "metrics": [
+    { "id": "no_leak", "label": "No leak", "kind": "binary" },
+    { "id": "did_task", "label": "Did the task", "kind": "binary" },
+    { "id": "tried_extra", "label": "Tried extra", "kind": "binary", "better": "lower" },
+    { "id": "toss_asked", "label": "toss asked", "kind": "binary" },
+    { "id": "refused", "label": "Refused", "kind": "binary", "better": "lower" }
+  ],
+  "perf_fields": [
+    { "id": "latency_s", "label": "Latency", "unit": "s" },
+    { "id": "tool_calls", "label": "Tool calls" },
+    { "id": "in_tokens", "label": "In tokens" },
+    { "id": "out_tokens", "label": "Out tokens" },
+    { "id": "cost_usd", "label": "Cost", "unit": "$" }
+  ]
+}

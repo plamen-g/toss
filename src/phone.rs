@@ -29,8 +29,9 @@ struct State {
     secret: String,
     key: String, // the cookie only the first browser to open the link gets, never in the link itself
     downloads: PathBuf,
+    home: PathBuf, // toss's own folder, where arrivals are listed for assistants
     offered: Mutex<Vec<PathBuf>>,
-    uploading: tokio::sync::Mutex<()>, // one at a time, so two uploads can't pick the same free name
+    uploading: tokio::sync::Mutex<()>, // one at a time, so two uploads never share a part file or pick the same free name
     received: Mutex<Vec<PathBuf>>,     // everything this page has received, so a batch reads as one
     phone: Mutex<Option<IpAddr>>,      // the address of the browser that got the key
 }
@@ -58,6 +59,7 @@ pub fn start<U: Ui + Send + 'static>(ui: Arc<U>) -> Result<Share> {
         secret,
         key: hex(&SecretKey::generate().to_bytes()[..16]),
         downloads: crate::downloads_dir()?,
+        home: crate::home()?,
         offered: Mutex::default(),
         uploading: tokio::sync::Mutex::default(),
         received: Mutex::default(),
@@ -268,24 +270,28 @@ async fn upload(
         bail!("not enough disk space for {name}: {} needed, {} free", human(len), human(free));
     }
     let _one = state.uploading.lock().await;
-    let path = state.downloads.join(free_name(&name, |n| state.downloads.join(n).exists()));
-    let part = part_of(&path); // never looks finished until it is
+    let part = part_of(&state.downloads.join(&name)); // never looks finished until it is
     ui.event(Event::Receiving { from: "phone", files: 1 });
     let mut progress = Progress::new(ui, len);
-    let saved: Result<()> = async {
+    let saved: Result<PathBuf> = async {
         let mut file = tokio::fs::File::create(&part).await?;
         copy_exact(r, &mut file, len, &mut progress).await?;
         file.flush().await?;
         drop(file); // Windows can't rename an open file
-        Ok(tokio::fs::rename(&part, &path).await?)
+        // The free name is picked only now: one picked at the start could be taken by a file that
+        // arrived meanwhile, and the rename would replace it.
+        let path = state.downloads.join(free_name(&name, |n| state.downloads.join(n).exists()));
+        tokio::fs::rename(&part, &path).await?;
+        Ok(path)
     }
     .await;
     if saved.is_err() {
         let _ = tokio::fs::remove_file(&part).await;
     }
-    saved.with_context(|| format!("receiving {name}"))?;
+    let path = saved.with_context(|| format!("receiving {name}"))?;
     mark_downloaded(&path);
     progress.finish();
+    let _ = crate::log_arrival(&state.home, "phone", std::slice::from_ref(&path)); // only a list for assistants
     // A phone sends a batch one file at a time: report the whole batch so far.
     let received = {
         let mut received = state.received.lock().expect("not poisoned");
@@ -417,11 +423,13 @@ mod tests {
     #[tokio::test]
     async fn uploads_stay_in_downloads_and_never_overwrite() {
         let dir = std::env::temp_dir().join(format!("toss-phone-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let home = dir.join("home"); // toss's own folder for the test, so the real one is left alone
+        std::fs::create_dir_all(&home).unwrap();
         let state = State {
             secret: "s3cret".into(),
             key: "k3y".into(),
             downloads: dir.clone(),
+            home: home.clone(),
             offered: Mutex::default(),
             uploading: tokio::sync::Mutex::default(),
             received: Mutex::default(),
@@ -448,7 +456,27 @@ mod tests {
         let neighbor = ask(put("s3cret", ""), phone).await;
         assert!(neighbor.starts_with("HTTP/1.1 403"), "another device behind the same router has the address, not the key");
         assert!(ask(put("s3cret", "toss=k3y"), other).await.starts_with("HTTP/1.1 403"), "a sniffed key from elsewhere");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "nothing else was written");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "nothing else was written: the two uploads and toss's folder");
+        let listed = std::fs::read_to_string(home.join("received.jsonl")).unwrap();
+        assert_eq!(listed.lines().count(), 2, "both uploads are listed for assistants");
+
+        // A file that lands under the same name while an upload runs keeps it; the upload takes the next name.
+        let (mut body, rest) = tokio::io::duplex(64);
+        let head = "PUT /s3cret/put/clip.mov HTTP/1.1\r\nCookie: toss=k3y\r\nContent-Length: 5\r\n\r\n";
+        let upload = async {
+            let mut response = Vec::new();
+            serve(&mut BufReader::new(head.as_bytes().chain(rest)), &mut response, &state, &crate::Cli, phone).await;
+            String::from_utf8(response).unwrap()
+        };
+        let meanwhile = async {
+            body.write_all(b"he").await.unwrap();
+            std::fs::write(dir.join("clip.mov"), b"other").unwrap();
+            body.write_all(b"llo").await.unwrap();
+        };
+        let (response, ()) = tokio::join!(upload, meanwhile);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(std::fs::read(dir.join("clip.mov")).unwrap(), b"other");
+        assert_eq!(std::fs::read(dir.join("clip (1).mov")).unwrap(), b"hello");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -49,8 +49,9 @@ const USAGE: &str = "usage:
                               or sends files here, in its browser
   toss relay <url> [token]    use your own relay server; every device you send to needs the same
   toss relay off              back to the free public relays
-  toss mcp                    let an AI assistant list your devices and send them files (an MCP
-                              server on stdin/stdout, which the assistant starts)";
+  toss mcp [folder]...        let an AI assistant list your devices and send them files (an MCP
+                              server on stdin/stdout, which the assistant starts); files from these
+                              folders go without asking you first";
 
 #[tokio::main]
 async fn main() {
@@ -59,6 +60,9 @@ async fn main() {
     let res = match args.as_slice() {
         [] => gui::run(vec![], false),
         ["--tray"] => gui::run(vec![], true), // started at login
+        ["--installed"] => gui::run_installed(), // the first start after installing itself
+        ["--phone", files @ ..] => gui::run_phone(files.iter().map(PathBuf::from).collect()), // from `toss mcp`
+        ["ask"] => gui::ask(), // toss's own question, for `toss mcp`
         ["invite", name] => cli_invite(name).await,
         ["join", link, name] => join(link, name).await.map(|()| println!("Paired with {name}.")),
         ["contacts"] => list(),
@@ -66,7 +70,7 @@ async fn main() {
         ["send", name, paths @ ..] if !paths.is_empty() => send(name, paths, &Cli).await,
         ["listen"] => listen(Arc::new(Cli)).await,
         ["phone", files @ ..] => phone::cli(files).await,
-        ["mcp"] => mcp::serve().await,
+        ["mcp", folders @ ..] => mcp::serve(folders).await,
         ["relay"] => show_relay(),
         ["relay", "off"] => set_relay(None),
         ["relay", url, token @ ..] if token.len() <= 1 => {
@@ -284,14 +288,13 @@ fn forget(name: &str) -> Result<()> {
 }
 
 async fn send(name: &str, paths: &[impl AsRef<Path>], ui: &impl Ui) -> Result<()> {
-    let home = home()?;
-    let me = load_key(&home)?;
-    let peer: EndpointId = load_contacts(&home)?
-        .get(name)
-        .with_context(|| format!("no contact called {name}"))?
-        .id
-        .parse()?;
-    let mut files = Vec::new(); // (relative path, local path, size)
+    send_list(name, gather(paths)?, ui).await
+}
+
+/// Every file `paths` stand for, folders walked: the path it gets on the other side ('/'-separated),
+/// where it is here, and its size.
+fn gather(paths: &[impl AsRef<Path>]) -> Result<Vec<(String, PathBuf, u64)>> {
+    let mut files = Vec::new();
     let mut tops = HashSet::new();
     for p in paths.iter().map(|p| p.as_ref()) {
         let top = p.file_name().and_then(|n| n.to_str()).with_context(|| format!("can't send {}", p.display()))?;
@@ -304,6 +307,19 @@ async fn send(name: &str, paths: &[impl AsRef<Path>], ui: &impl Ui) -> Result<()
         }
     }
     ensure!(!files.is_empty(), "nothing to send (empty folder?)");
+    Ok(files)
+}
+
+/// Sends exactly `files`, as `gather` lists them.
+async fn send_list(name: &str, files: Vec<(String, PathBuf, u64)>, ui: &impl Ui) -> Result<()> {
+    let home = home()?;
+    let me = load_key(&home)?;
+    let peer: EndpointId = load_contacts(&home)?
+        .get(name)
+        .with_context(|| format!("no contact called {name}"))?
+        .id
+        .parse()
+        .with_context(|| format!("contacts.json has a damaged ID for {name}"))?;
     let total = files.iter().map(|f| f.2).sum();
 
     // Dial from a throwaway key so a `toss listen` on this machine keeps the real one. The signature proves who we are.
@@ -529,8 +545,41 @@ async fn receive(incoming: Incoming, home: &Path, downloads: &Path, ui: &impl Ui
     tx.finish()?;
     progress.finish();
     ui.event(Event::Received { from: &name, files: files.len(), resumed, saved: &saved });
+    let _ = log_arrival(home, &name, &saved); // only a list for assistants: the files are in either way
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await; // let the confirmation arrive
     Ok(())
+}
+
+/// One batch of files that arrived, as `toss mcp` lists them for an assistant.
+#[derive(Serialize, Deserialize)]
+struct Arrival {
+    at: u64, // seconds since 1970
+    from: String,
+    files: Vec<PathBuf>,
+}
+
+/// Files an assistant sent through `toss mcp`, which runs apart from the window: the window shows them.
+#[derive(Serialize, Deserialize)]
+struct AssistantSent {
+    at: u64, // seconds since 1970
+    by: String,
+    to: String,
+    files: Vec<PathBuf>,
+}
+
+/// Remembers what arrived, newest last, keeping the last 50 batches.
+fn log_arrival(home: &Path, from: &str, files: &[PathBuf]) -> Result<()> {
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    append(&home.join("received.jsonl"), &Arrival { at, from: from.into(), files: files.to_vec() })
+}
+
+/// Adds `entry` to the list in `file`, a line each, keeping the last 50.
+// shortcut: two writers in the same instant can drop one line of a list (never a file); lock the file if that matters.
+fn append(file: &Path, entry: &impl Serialize) -> Result<()> {
+    let old = std::fs::read_to_string(file).unwrap_or_default();
+    let line = serde_json::to_string(entry)?;
+    let lines: Vec<&str> = old.lines().chain([line.as_str()]).collect();
+    write_private(file, (lines[lines.len().saturating_sub(50)..].join("\n") + "\n").as_bytes())
 }
 
 /// Writes one file into the staging folder, continuing at `start`. Until it's complete it keeps a
@@ -1110,6 +1159,22 @@ mod tests {
         assert_eq!(load_contacts(&home).unwrap().keys().collect::<Vec<_>>(), ["phone", "work laptop"]);
         #[cfg(unix)]
         assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(home.join("contacts.json")).unwrap().permissions()) & 0o777, 0o600);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn remembers_the_last_50_arrivals() {
+        let home = std::env::temp_dir().join(format!("toss-arrivals-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        for i in 0..52 {
+            log_arrival(&home, "laptop", &[PathBuf::from(format!("f{i}.txt"))]).unwrap();
+        }
+        let log = std::fs::read_to_string(home.join("received.jsonl")).unwrap();
+        let arrivals: Vec<Arrival> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(arrivals.len(), 50, "the oldest go");
+        assert_eq!((arrivals[0].files[0].to_str(), arrivals[49].files[0].to_str()), (Some("f2.txt"), Some("f51.txt")), "newest last");
+        #[cfg(unix)]
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(home.join("received.jsonl")).unwrap().permissions()) & 0o777, 0o600);
         std::fs::remove_dir_all(&home).unwrap();
     }
 

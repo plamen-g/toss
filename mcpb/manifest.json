@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "toss",
   "display_name": "toss",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Send files to your own devices and friends, peer to peer and end-to-end encrypted.",
-  "long_description": "toss sends files straight between devices: no accounts, no cloud storage, end-to-end encrypted with a post-quantum key exchange. With this extension Claude can list your paired devices and send them files, and nothing else: pairing, removing devices and settings stay with you.\n\nPair your devices first with the toss app ([download](https://github.com/plamen-g/toss/releases)). Someone on the other device still accepts each transfer, unless it takes files from yours without asking.",
+  "long_description": "toss sends files straight between devices: no accounts, no cloud storage, end-to-end encrypted with a post-quantum key exchange. With this extension Claude can list your paired devices, send them files, put files on your phone and see what arrived lately, and nothing else: pairing, removing devices and settings stay with you. toss itself asks you, in a window of its own, before anything leaves from outside the folders you pick here, and before any file that looks like a secret.\n\nPair your devices first with the toss app ([download](https://github.com/plamen-g/toss/releases)). Someone on the other device still accepts each transfer, unless it takes files from yours without asking.",
   "author": {
     "name": "plamen-g",
     "url": "https://github.com/plamen-g"
@@ -22,15 +22,26 @@
     "entry_point": "server/toss",
     "mcp_config": {
       "command": "${__dirname}/server/toss",
-      "args": ["mcp"],
+      "args": ["mcp", "${user_config.folders}"],
       "platform_overrides": {
         "win32": { "command": "${__dirname}/server/toss.exe" }
       }
     }
   },
+  "user_config": {
+    "folders": {
+      "type": "directory",
+      "title": "Folders Claude may send from without asking",
+      "description": "toss asks you first before it sends files from anywhere else.",
+      "multiple": true,
+      "required": false
+    }
+  },
   "tools": [
     { "name": "list_devices", "description": "List the devices paired with toss." },
-    { "name": "send_files", "description": "Send files or folders to a paired device, end-to-end encrypted." }
+    { "name": "received_files", "description": "List what arrived through toss lately, and where it was saved." },
+    { "name": "send_files", "description": "Send files or folders to a paired device, end-to-end encrypted." },
+    { "name": "show_on_phone", "description": "Put files on your phone: the toss window shows a QR code to scan." }
   ],
   "keywords": ["file transfer", "send files", "peer to peer", "encrypted", "airdrop"],
   "license": "MIT",

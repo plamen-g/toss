@@ -4,7 +4,7 @@
 
 Send files to your own devices and your friends, peer to peer. No IP addresses to type, no accounts, and your files never sit on a server.
 
-Pair once with an invite link, then toss files by name from any network. Run `toss` to open the window: drag files onto it (or click **Toss**) and pick a device. Closing the window keeps toss receiving from the tray. Right-click the tray icon to start toss at login and, on Windows, to add it to Explorer's **Send to** menu. (On GNOME the tray needs the AppIndicator extension.)
+Pair once with an invite link, then toss files by name from any network. Run `toss` to open the window: drag files onto it (or click **Toss**) and pick a device. Closing the window keeps toss receiving from the tray. Right-click the tray icon to start toss at login, use it with Claude Code and, on Windows, add it to Explorer's **Send to** menu. (On GNOME the tray needs the AppIndicator extension.)
 
 The same from the command line:
 
@@ -26,17 +26,17 @@ Click **Phone** (or run `toss phone [file]...`) and scan the QR code. The phone'
 
 ## AI assistants (MCP)
 
-`toss mcp` lets an assistant like Claude send files to your devices: "send the chart you just made to my laptop". It can list your paired devices and send to them, nothing else. Pairing, removing devices and settings stay with you, and someone on the other device still accepts each transfer, unless it takes files from yours without asking. Progress shows while files move, and a cancelled send resumes the next time.
+`toss mcp` lets an assistant like Claude send files to your devices: "send the chart you just made to my laptop". It can list your paired devices, send to them, put files on your phone ("put this on my phone": the toss window shows a QR code to scan), and see what arrived lately ("open the photo my phone just sent"; toss keeps the names of the last 50 arrivals in its folder for this). Nothing else: pairing, removing devices and settings stay with you, and someone on the other device still accepts each transfer, unless it takes files from yours without asking. The toss window shows what assistants sent.
 
-Claude Desktop: download `toss.mcpb` from [Releases](https://github.com/plamen-g/toss/releases) and open it. Claude Code: `claude mcp add toss -- toss mcp`. Other assistants (Cursor, ...) take it in their MCP config:
+What an assistant reads can steer it, so toss decides what leaves, not the assistant. Files from the folders you name go at once. For anything else, and for files that look like secrets (keys, `.env`, password databases) even inside those folders, toss asks you itself: in a window of its own that no assistant or app can answer for you, or through the assistant's app on a computer without a screen. The question shows where the files really are and how much would go. Tick **Don't ask again** to let a folder through from then on; the tray lists those folders, and clicking one takes it off. toss's own folder, with your device key, never goes. toss knows secrets by their file names, not their contents, so keep other secrets out of the folders you allow. How this holds up against prompt injection: [evals/injection](evals/injection/README.md).
+
+Claude Code: installed on Windows, toss adds itself (tray menu: **Use with Claude Code**) and asks you before every send. By hand: `claude mcp add toss -- toss mcp ~/projects`. Claude Desktop: download `toss.mcpb` from [Releases](https://github.com/plamen-g/toss/releases), open it and pick the folders. Other assistants (Cursor, ...) take it in their MCP config:
 
 ```json
-{ "mcpServers": { "toss": { "command": "toss", "args": ["mcp"] } } }
+{ "mcpServers": { "toss": { "command": "toss", "args": ["mcp", "/path/to/projects"] } } }
 ```
 
-It's in the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.plamen-g/toss`.
-
-What an assistant reads can steer it, so approve its sends yourself rather than allowing them always.
+Where the assistant supports it, a send runs as a task, so waiting for someone to accept can't time out. Progress shows while files move, and a cancelled send resumes the next time. It's in the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.plamen-g/toss`.
 
 ## Privacy
 
@@ -58,7 +58,9 @@ To show less:
 
 ## Install
 
-Get the file for your system from [Releases](https://github.com/plamen-g/toss/releases) and put `toss` on your PATH. Builds aren't signed yet: on Windows click "More info" → "Run anyway", on macOS run `xattr -d com.apple.quarantine toss`. Or build it: `cargo build --release` (about 14 MB).
+On Windows, download `toss-windows-x86_64.exe` from [Releases](https://github.com/plamen-g/toss/releases) and open it: toss installs itself, with a Start menu entry, starting at login, and Claude Code if you have it. Opening a newer download updates it. Builds aren't signed yet, so Windows asks first: click "More info" → "Run anyway".
+
+On macOS and Linux, put `toss` from Releases on your PATH (on macOS, run `xattr -d com.apple.quarantine toss` first). Or build it: `cargo build --release` (about 14 MB).
 
 Keys and contacts live in `%APPDATA%\toss`, `~/.config/toss` or `~/Library/Application Support/toss`, or wherever `TOSS_HOME` points.
 

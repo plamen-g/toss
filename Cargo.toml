@@ -1,6 +1,6 @@
 [package]
 name = "toss"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Send files to your own devices and friends, peer to peer. No IP addresses, no accounts."
 license = "MIT"
@@ -15,13 +15,13 @@ icu_normalizer = "2" # already in the build through iroh; compares file names li
 iroh = { version = "1.4.1", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath"] }
 qrcodegen = "1.8"
 rfd = "0.17.2"
-rmcp = { version = "3.8", features = ["transport-io", "schemars"] } # the official MCP SDK, for `toss mcp`
+rmcp = { version = "3.8", features = ["transport-io", "schemars", "elicitation"] } # the official MCP SDK, for `toss mcp`
 rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Software renderer only: the GPU renderers cost 50-150 MB of RAM for a window this simple.
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "software-renderer-systemfonts", "accessibility", "system-tray", "software-renderer-path", "unstable-winit-030"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "process", "time", "sync"] }
 
 [profile.release]
 opt-level = "s"

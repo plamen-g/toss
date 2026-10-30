@@ -17,7 +17,7 @@ use tokio::{io::AsyncReadExt, sync::oneshot};
 use crate::{Answer, Event, Ui, count, human};
 
 slint::slint! {
-    import { ListView, Palette } from "std-widgets.slint";
+    import { CheckBox, ListView, Palette } from "std-widgets.slint";
     import "assets/BricolageGrotesque-Bold.ttf"; // the wordmark and page titles; names stay in the system font
 
     export struct Device { name: string, initial: string, tint: color, auto: bool }
@@ -998,9 +998,14 @@ slint::slint! {
         in property <bool> autostart;
         in property <bool> explorer; // toss is in Explorer's "Send to" menu
         in property <bool> windows;
+        in property <bool> claude-found; // Claude Code is installed
+        in property <bool> in-claude; // and it runs toss
+        in property <[string]> folders; // assistants send from these without asking: the user said "don't ask again"
         callback open();
         callback toggle-autostart();
         callback toggle-explorer();
+        callback toggle-claude();
+        callback forget(string);
         callback quit();
         clicked => { root.open(); }
         // Slint's tray menus don't draw check marks (checked), so the title carries one.
@@ -1008,7 +1013,45 @@ slint::slint! {
             MenuItem { title: "Open toss"; activated => { root.open(); } }
             MenuItem { title: (root.autostart ? "✓ " : "") + "Start at login"; activated => { root.toggle-autostart(); } }
             if root.windows: MenuItem { title: (root.explorer ? "✓ " : "") + "In Explorer's Send to menu"; activated => { root.toggle-explorer(); } }
+            if root.claude-found: MenuItem { title: (root.in-claude ? "✓ " : "") + "Use with Claude Code"; activated => { root.toggle-claude(); } }
+            if root.folders.length > 0: Menu {
+                title: "Assistants send without asking from";
+                for folder in root.folders: MenuItem { title: "✓ " + folder; activated => { root.forget(folder); } }
+            }
             MenuItem { title: "Quit"; activated => { root.quit(); } }
+        }
+    }
+
+    // toss's own question before an assistant's send (`toss ask`, for `toss mcp`): a window of its own,
+    // so no assistant or app can answer it for the user.
+    export component AskWindow inherits Window {
+        title: "toss";
+        icon: @image-url("assets/icon.png");
+        always-on-top: true;
+        preferred-width: 520px;
+        default-font-size: 14px;
+        background: @linear-gradient(180deg, Theme.bg-top 0%, Theme.bg-bottom 100%);
+        init => { Palette.color-scheme = ColorScheme.dark; }
+
+        in property <string> question;
+        in property <string> details;
+        in property <string> yes;
+        in property <string> remember-label; // "" when there's no folder to remember
+        in-out property <bool> remember;
+        callback answer(bool);
+
+        VerticalLayout {
+            padding: 22px;
+            spacing: 14px;
+            Text { text: root.question; color: Theme.text; font-size: 16px; font-weight: 600; wrap: word-wrap; }
+            Text { text: root.details; color: Theme.muted; wrap: char-wrap; } // paths have no spaces to break at
+            if root.remember-label != "": CheckBox { text: root.remember-label; checked <=> root.remember; }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 10px;
+                PillButton { text: "Don't send"; clicked => { root.answer(false); } }
+                PillButton { text: root.yes; primary: true; clicked => { root.answer(true); } }
+            }
         }
     }
 }
@@ -1085,6 +1128,16 @@ impl Gui {
         let _ = w.show();
         w.window().set_minimized(false);
         w.window().with_winit_window(|w| w.focus_window());
+    }
+
+    /// Brings the window up on its phone page, offering `files`.
+    fn phone_page(self: &Arc<Self>, w: &AppWindow, files: Vec<PathBuf>) {
+        self.raise(w, vec![]);
+        w.set_page(2);
+        w.invoke_phone_open();
+        // After phone-open's own update, which empties the list of what's offered.
+        let g = self.clone();
+        self.update(move |w| g.drop_all(&w, files));
     }
 
     /// The dropped items, if any are waiting; taking them clears the banner.
@@ -1259,12 +1312,51 @@ impl Ui for Gui {
 /// `hidden`, only the tray icon (at login).
 pub fn run(items: Vec<PathBuf>, hidden: bool) -> Result<()> {
     hide_console();
+    // Just downloaded and opened: install, rather than run from Downloads.
+    #[cfg(windows)]
+    if items.is_empty() && !hidden && downloaded(&std::env::current_exe()?) {
+        match install() {
+            Ok(()) => return Ok(()),
+            Err(e) => alert(&format!("Couldn't install toss, so it runs from where it is: {e:#}")),
+        }
+    }
+    open(items, hidden, false)
+}
+
+/// The window on its phone page, offering `files` (for an assistant, through `toss mcp`).
+pub fn run_phone(files: Vec<PathBuf>) -> Result<()> {
+    hide_console();
+    open(files, false, true)
+}
+
+/// The first start of a toss that `install` just put in place: it goes in the Start menu, starts at
+/// login and joins Claude Code (when that's installed), then opens.
+pub fn run_installed() -> Result<()> {
+    hide_console();
+    let _ = std::fs::remove_file(std::env::current_exe()?.with_file_name("toss.old")); // what an update replaced, unless it still runs
+    let setup = (|| -> Result<()> {
+        #[cfg(windows)]
+        shortcut(&start_menu()?, "")?;
+        set_autostart(true)?;
+        if find_claude().is_some() {
+            set_claude_code(true)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = setup {
+        alert(&format!("toss is installed, but: {e:#}"));
+    }
+    open(vec![], false, false)
+}
+
+/// `items` wait for a device, or with `phone`, are offered on the phone page.
+fn open(items: Vec<PathBuf>, hidden: bool, phone: bool) -> Result<()> {
     let home = crate::home()?;
     // shortcut: the probe lock is released before listen() takes it, so two copies started at the
     // same instant could both pass; harmless, the second's listen() then reports the clash.
     if crate::lock_listener(&home).is_err() {
         // The toss that's running shows its window, with the items.
-        if !hidden && hand_over(&home, &items).is_err() {
+        if !hidden && hand_over(&home, Some(&items), phone).is_err() {
             alert("toss is already running. Open it from its icon in the system tray (near the clock).");
         }
         return Ok(());
@@ -1281,7 +1373,13 @@ pub fn run(items: Vec<PathBuf>, hidden: bool) -> Result<()> {
         dropped: Mutex::default(),
     });
     gui.refresh_devices();
-    gui.drop_all(&win, items);
+    // For the phone page, the items wait until that page is set up, below.
+    let for_phone = if phone {
+        Some(items)
+    } else {
+        gui.drop_all(&win, items);
+        None
+    };
 
     // Another toss started while this one runs hands over its items through this local port, with a
     // secret only this user can read.
@@ -1298,10 +1396,24 @@ pub fn run(items: Vec<PathBuf>, hidden: bool) -> Result<()> {
             if !matches!(read, Ok(Ok(_))) {
                 continue;
             }
-            let Ok((got, items)) = serde_json::from_slice::<(String, Vec<PathBuf>)>(&bytes) else { continue };
-            if crate::same(got.as_bytes(), secret.as_bytes()) {
-                let g2 = g.clone();
-                g.update(move |w| g2.raise(&w, items));
+            let parsed = serde_json::from_slice::<(String, Option<Vec<PathBuf>>)>(&bytes)
+                .map(|(got, items)| (got, items, false))
+                .or_else(|_| serde_json::from_slice::<(String, Option<Vec<PathBuf>>, bool)>(&bytes));
+            let Ok((got, items, phone)) = parsed else { continue };
+            if !crate::same(got.as_bytes(), secret.as_bytes()) {
+                continue;
+            }
+            match items {
+                Some(items) if phone => {
+                    let g2 = g.clone();
+                    g.update(move |w| g2.phone_page(&w, items));
+                }
+                Some(items) => {
+                    let g2 = g.clone();
+                    g.update(move |w| g2.raise(&w, items));
+                }
+                // An update asks this toss to quit, so the new one can take its place.
+                None => drop(slint::invoke_from_event_loop(|| drop(slint::quit_event_loop()))),
             }
         }
     });
@@ -1522,12 +1634,58 @@ pub fn run(items: Vec<PathBuf>, hidden: bool) -> Result<()> {
         }
         t.set_explorer(explorer_menu());
     });
+    tray.set_claude_found(find_claude().is_some());
+    tray.set_in_claude(in_claude().is_some());
+    let t = tray.as_weak();
+    tray.on_toggle_claude(move || {
+        let Some(t) = t.upgrade() else { return };
+        if let Err(e) = set_claude_code(!t.get_in_claude()) {
+            alert(&format!("Couldn't change Claude Code's settings: {e:#}"));
+        }
+        t.set_in_claude(in_claude().is_some());
+    });
+    tray.set_folders(folder_list(&gui.home));
+    let (t, home) = (tray.as_weak(), gui.home.clone());
+    tray.on_forget(move |folder| {
+        if let Err(e) = crate::mcp::forget(&home, &folder) {
+            alert(&format!("Couldn't change the list: {e:#}"));
+        }
+        if let Some(t) = t.upgrade() {
+            t.set_folders(folder_list(&home));
+        }
+    });
+    // `toss mcp` runs apart, one for each assistant: keep up with the folders it was told not to ask
+    // about again, and show what it sends.
+    fn modified(file: &Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(file).and_then(|m| m.modified()).ok()
+    }
+    let (folders, sent) = (gui.home.join("folders.json"), gui.home.join("sent.jsonl"));
+    let mut seen = (modified(&folders), modified(&sent));
+    let (g, t) = (gui.clone(), tray.as_weak());
+    let mcp_watch = slint::Timer::default();
+    mcp_watch.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(2), move || {
+        let now = (modified(&folders), modified(&sent));
+        if now.0 != seen.0
+            && let Some(t) = t.upgrade()
+        {
+            t.set_folders(folder_list(&g.home));
+        }
+        if now.1 != seen.1
+            && let Some(s) = last_sent(&sent)
+        {
+            let names = listed(s.files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect());
+            g.show(DONE, format!("{} sent {} to {}", s.by, count(s.files.len()), s.to), names, false);
+        }
+        seen = now;
+    });
     tray.on_quit(|| {
         let _ = slint::quit_event_loop();
     });
 
     // Closing the window only hides it (Slint's default); toss keeps receiving until Quit.
-    if !hidden {
+    if let Some(files) = for_phone {
+        gui.phone_page(&win, files);
+    } else if !hidden {
         win.show()?;
     }
     slint::run_event_loop_until_quit()?;
@@ -1535,12 +1693,81 @@ pub fn run(items: Vec<PathBuf>, hidden: bool) -> Result<()> {
     Ok(())
 }
 
-/// Hands items to the toss that's already running, whose window then comes up.
-fn hand_over(home: &Path, items: &[PathBuf]) -> Result<()> {
+/// Hands items to the toss that's already running, whose window then comes up with them waiting for a
+/// device, or with `phone`, offering them on the phone page. None asks it to quit.
+fn hand_over(home: &Path, items: Option<&[PathBuf]>, phone: bool) -> Result<()> {
     let text = std::fs::read_to_string(home.join("window"))?;
     let (port, secret) = text.split_once(' ').context("bad window file")?;
     let stream = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>()?))?;
-    Ok(serde_json::to_writer(stream, &(secret, items))?)
+    // Without `phone`, the message is the one older tosses know.
+    Ok(if phone { serde_json::to_writer(stream, &(secret, items, true)) } else { serde_json::to_writer(stream, &(secret, items)) }?)
+}
+
+/// Opens the phone page with `files` offered: in the toss that's running, else in a new one.
+pub fn show_on_phone(home: &Path, files: &[PathBuf]) -> Result<()> {
+    if crate::lock_listener(home).is_err() {
+        return hand_over(home, Some(files), true).context("toss is running without its window");
+    }
+    let start = |out_of_job: bool| {
+        let null = std::process::Stdio::null; // never `toss mcp`'s own input and output, which carry MCP
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg("--phone").args(files).stdin(null()).stdout(null()).stderr(null());
+        // CREATE_NO_WINDOW, and CREATE_BREAKAWAY_FROM_JOB: an app that closes its MCP servers' processes
+        // together would close this window with them.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000 | if out_of_job { 0x0100_0000 } else { 0 });
+        cmd.spawn()
+    };
+    start(true).or_else(|_| start(false))?; // the app's job may not let it out
+    Ok(())
+}
+
+/// The newest send `toss mcp` noted in `log`.
+fn last_sent(log: &Path) -> Option<crate::AssistantSent> {
+    serde_json::from_str(std::fs::read_to_string(log).ok()?.lines().last()?).ok()
+}
+
+/// The remembered folders, as the tray lists them.
+fn folder_list(home: &Path) -> ModelRc<SharedString> {
+    let folders: Vec<SharedString> = crate::mcp::remembered(home).iter().map(|f| crate::mcp::shown(f).into()).collect();
+    ModelRc::new(VecModel::from(folders))
+}
+
+/// What `toss mcp` asks through `toss ask`: JSON on its input.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Question {
+    pub question: String,
+    pub details: String,
+    pub yes: String,             // the button that sends
+    pub remember: Option<String>, // the folder "don't ask again" would let through
+}
+
+/// The answer `toss ask` prints.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Said {
+    pub send: bool,
+    pub remember: bool,
+}
+
+/// `toss ask`: shows `toss mcp`'s question in a window of toss's own, then prints the answer.
+pub fn ask() -> Result<()> {
+    let question: Question = serde_json::from_reader(std::io::stdin())?;
+    let win = AskWindow::new()?;
+    win.set_question(question.question.into());
+    win.set_details(question.details.into());
+    win.set_yes(question.yes.into());
+    win.set_remember_label(question.remember.map(|f| format!("Don't ask again for {f}")).unwrap_or_default().into());
+    let send = std::rc::Rc::new(std::cell::Cell::new(false));
+    let s = send.clone();
+    win.on_answer(move |yes| {
+        s.set(yes);
+        let _ = slint::quit_event_loop();
+    });
+    win.show()?;
+    slint::run_event_loop()?; // closing the window counts as no
+    let said = Said { send: send.get(), remember: send.get() && win.get_remember() };
+    println!("{}", serde_json::to_string(&said)?);
+    Ok(())
 }
 
 fn alert(text: &str) {
@@ -1719,6 +1946,112 @@ fn remove(item: &Path) -> Result<()> {
     }
 }
 
+/// Whether this file came from the internet: Windows marks downloads with a Zone.Identifier stream.
+#[cfg(windows)]
+fn downloaded(file: &Path) -> bool {
+    let mut mark = file.as_os_str().to_owned();
+    mark.push(":Zone.Identifier");
+    std::fs::read_to_string(mark).is_ok_and(|zone| zone.contains("ZoneId=3"))
+}
+
+/// Installs this download for the current user, into %LOCALAPPDATA%\Programs\toss, and starts it there.
+/// A toss running already (an older version) is asked to quit first, so this one takes its place.
+#[cfg(windows)]
+fn install() -> Result<()> {
+    let home = crate::home()?;
+    if crate::lock_listener(&home).is_err() {
+        let _ = hand_over(&home, None, false);
+        for _ in 0..50 {
+            if crate::lock_listener(&home).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let dir = dirs::data_local_dir().context("no local AppData folder")?.join(r"Programs\toss");
+    no_console(Command::new(install_copy(&std::env::current_exe()?, &dir)?).arg("--installed")).spawn()?;
+    Ok(())
+}
+
+/// Puts a copy of `from` in `dir` as toss.exe. A toss.exe that still runs can't be overwritten, but it
+/// can be moved aside, to toss.old.
+#[cfg(windows)]
+fn install_copy(from: &Path, dir: &Path) -> Result<PathBuf> {
+    let bytes = std::fs::read(from)?;
+    std::fs::create_dir_all(dir)?;
+    let (exe, old) = (dir.join("toss.exe"), dir.join("toss.old"));
+    let _ = std::fs::remove_file(&old);
+    if exe.exists() {
+        std::fs::rename(&exe, &old)?;
+    }
+    // Written afresh, as installers write: a copy would keep the download mark, and the installed toss
+    // would then install itself again.
+    std::fs::write(&exe, bytes)?;
+    Ok(exe)
+}
+
+/// toss's entry in the Start menu, which installing adds.
+#[cfg(windows)]
+fn start_menu() -> Result<PathBuf> {
+    Ok(dirs::data_dir().context("no AppData folder")?.join(r"Microsoft\Windows\Start Menu\Programs\toss.lnk"))
+}
+
+/// Starts a console program from the window without a console flashing up (on Windows).
+fn no_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(cmd, 0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
+/// Claude Code's command: on the PATH when it's installed for the terminal, otherwise the newest copy
+/// the Claude app keeps for its Code tab.
+fn find_claude() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|candidate| candidate.is_file())
+        .or_else(|| newest_claude(&dirs::config_dir()?.join("Claude").join("claude-code")))
+}
+
+/// The newest of the Claude app's copies of Claude Code, kept as `root`/<version>/<build>/claude.
+/// By date, not name: "2.1.100" sorts before "2.1.99".
+fn newest_claude(root: &Path) -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "claude.exe" } else { "claude" };
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .flat_map(|version| std::fs::read_dir(version.path()).into_iter().flatten().flatten())
+        .map(|build| build.path().join(exe))
+        .filter_map(|claude| Some((claude.metadata().ok()?.modified().ok()?, claude)))
+        .max()
+        .map(|(_, claude)| claude)
+}
+
+/// The toss Claude Code runs, if any: what `claude mcp add --scope user` saved in its config file.
+fn in_claude() -> Option<PathBuf> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from).or_else(dirs::home_dir)?;
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(".claude.json")).ok()?).ok()?;
+    config["mcpServers"]["toss"]["command"].as_str().map(PathBuf::from)
+}
+
+/// Adds this toss to Claude Code for every project, or takes it out, through Claude Code's own command,
+/// which keeps its config file intact. No folders go without asking: toss asks before every send.
+fn set_claude_code(on: bool) -> Result<()> {
+    let claude = find_claude().context("Claude Code isn't installed")?;
+    let run = |cmd: &mut Command| -> Result<()> {
+        let out = no_console(cmd).output()?;
+        anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr).trim());
+        Ok(())
+    };
+    // Out first, so adding it again points Claude Code at this copy of toss.
+    let removed = run(Command::new(&claude).args(["mcp", "remove", "--scope", "user", "toss"]));
+    if !on {
+        return removed;
+    }
+    run(Command::new(&claude).args(["mcp", "add", "--scope", "user", "toss", "--"]).arg(std::env::current_exe()?).arg("mcp"))
+}
+
 /// Saves a shortcut that starts this toss with `args`.
 #[cfg(windows)]
 fn shortcut(path: &Path, args: &str) -> Result<()> {
@@ -1737,8 +2070,44 @@ fn shortcut(path: &Path, args: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn a_download_installs_itself_without_its_download_mark() {
+        let dir = std::env::temp_dir().join(format!("toss-install-test-{}", std::process::id()));
+        let (download, programs) = (dir.join("toss-windows-x86_64.exe"), dir.join("Programs"));
+        std::fs::create_dir_all(&programs).unwrap();
+        std::fs::write(&download, b"new").unwrap();
+        assert!(!super::downloaded(&download), "built here, not downloaded");
+        std::fs::write(dir.join("toss-windows-x86_64.exe:Zone.Identifier"), "[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        assert!(super::downloaded(&download), "the browser's mark");
+
+        std::fs::write(programs.join("toss.exe"), b"old").unwrap();
+        let installed = super::install_copy(&download, &programs).unwrap();
+        assert_eq!(std::fs::read(&installed).unwrap(), b"new");
+        assert_eq!(std::fs::read(programs.join("toss.old")).unwrap(), b"old", "the toss it replaces is moved aside");
+        assert!(!super::downloaded(&installed), "else the installed toss would install itself again, and again");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finds_the_newest_claude_code_the_claude_app_keeps() {
+        let root = std::env::temp_dir().join(format!("toss-claude-test-{}", std::process::id()));
+        let exe = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let (older, newer) = (root.join("2.1.99").join("a1"), root.join("2.1.100").join("b2"));
+        for dir in [&older, &newer] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(exe), b"").unwrap();
+        }
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(older.join(exe)).unwrap().set_modified(hour_ago).unwrap();
+        assert_eq!(super::newest_claude(&root), Some(newer.join(exe)));
+        assert_eq!(super::newest_claude(&root.join("missing")), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
     #[test]
     fn saves_a_shortcut_with_its_arguments() {
         let path = std::env::temp_dir().join(format!("toss-test-{}.lnk", std::process::id()));
