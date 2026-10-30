@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "toss",
   "display_name": "toss",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Send files to your own devices and friends, peer to peer and end-to-end encrypted.",
   "long_description": "toss sends files straight between devices: no accounts, no cloud storage, end-to-end encrypted with a post-quantum key exchange. With this extension Claude can list your paired devices, send them files, put files on your phone and see what arrived lately, and nothing else: pairing, removing devices and settings stay with you. toss itself asks you, in a window of its own, before anything leaves from outside the folders you pick here, and before any file that looks like a secret.\n\nPair your devices first with the toss app ([download](https://github.com/plamen-g/toss/releases)). Someone on the other device still accepts each transfer, unless it takes files from yours without asking.",
   "author": {

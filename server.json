@@ -8,11 +8,11 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/plamen-g/toss",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/plamen-g/toss/releases/download/v0.3.1/toss.mcpb",
+      "identifier": "https://github.com/plamen-g/toss/releases/download/v0.3.2/toss.mcpb",
       "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "transport": {
         "type": "stdio"

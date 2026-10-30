@@ -329,6 +329,8 @@ slint::slint! {
         in property <string> placeholder;
         in property <string> label;
         in-out property <string> text <=> input.text;
+        callback accepted <=> input.accepted; // Enter
+        forward-focus: input;
         height: 36px;
         min-width: 0;
         horizontal-stretch: 1;
@@ -823,7 +825,11 @@ slint::slint! {
                     }
                     HorizontalLayout {
                         spacing: 8px;
-                        invite-name := Field { placeholder: "Device name"; label: "Name for the new device"; }
+                        invite-name := Field {
+                            placeholder: "Device name";
+                            label: "Name for the new device";
+                            accepted => { if (self.text != "") { root.invite(self.text); } }
+                        }
                         PillButton {
                             text: "Create code";
                             primary: true;
@@ -888,10 +894,30 @@ slint::slint! {
                             Text { text: "Type the code the other device shows."; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
                         }
                     }
-                    join-code := Field { placeholder: "Code, like 48213-otter-violin"; label: "Pairing code"; }
+                    join-code := Field {
+                        placeholder: "Code, like 48213-otter-violin";
+                        label: "Pairing code";
+                        accepted => {
+                            if (join-name.text == "") {
+                                join-name.focus();
+                            } else if (!root.busy && self.text != "") {
+                                root.join(self.text, join-name.text);
+                            }
+                        }
+                    }
                     HorizontalLayout {
                         spacing: 8px;
-                        join-name := Field { placeholder: "Device name"; label: "Name for the other device"; }
+                        join-name := Field {
+                            placeholder: "Device name";
+                            label: "Name for the other device";
+                            accepted => {
+                                if (join-code.text == "") {
+                                    join-code.focus();
+                                } else if (!root.busy && self.text != "") {
+                                    root.join(join-code.text, self.text);
+                                }
+                            }
+                        }
                         PillButton {
                             text: root.busy ? "Joining…" : "Join";
                             primary: true;
