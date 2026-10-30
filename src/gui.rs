@@ -526,7 +526,7 @@ slint::slint! {
                         spacing: 10px;
                         Text { text: "Remove " + root.device.name + "?"; font-weight: 700; color: Theme.text; }
                         Text {
-                            text: "Deletes the pairing. Reconnecting needs a new invite link.";
+                            text: "Deletes the pairing. Reconnecting needs a new pairing code.";
                             font-size: 12px;
                             color: Theme.muted;
                             wrap: word-wrap;
@@ -578,7 +578,7 @@ slint::slint! {
         in property <color> offer-tint;
         in property <string> offer-summary;
         in property <string> offer-files;
-        in property <string> link; // invite link to share, "" when none
+        in property <string> code; // pairing code to share, "" when none
         in property <string> pair-error;
         in property <bool> busy; // joining
         in-out property <bool> copied;
@@ -817,52 +817,56 @@ slint::slint! {
                         VerticalLayout {
                             alignment: center;
                             spacing: 2px;
-                            Text { text: "Invite link"; font-size: 15px; font-weight: 700; color: Theme.text; }
-                            Text { text: "One-time pairing link. Valid while toss is running."; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+                            Text { text: "Pairing code"; font-size: 15px; font-weight: 700; color: Theme.text; }
+                            Text { text: "The other device types it in. Works once, while toss is running."; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
                         }
                     }
                     HorizontalLayout {
                         spacing: 8px;
                         invite-name := Field { placeholder: "Device name"; label: "Name for the new device"; }
                         PillButton {
-                            text: "Create link";
+                            text: "Create code";
                             primary: true;
                             enabled: invite-name.text != "";
                             clicked => { root.invite(invite-name.text); }
                         }
                     }
-                    if root.link != "": VerticalLayout {
+                    if root.code != "": VerticalLayout {
                         spacing: 10px;
                         HorizontalLayout {
                             spacing: 8px;
                             Rectangle {
                                 horizontal-stretch: 1;
                                 min-width: 0;
-                                height: 36px;
+                                height: 44px;
                                 border-radius: 10px;
                                 background: #00000033;
                                 border-width: 1px;
                                 border-color: Theme.line;
-                                link-text := TextInput {
+                                code-text := TextInput {
                                     x: 12px;
                                     width: parent.width - 24px;
                                     height: parent.height;
-                                    text: root.link;
+                                    text: root.code;
                                     read-only: true;
                                     single-line: true;
                                     vertical-alignment: center;
-                                    font-size: 12px;
+                                    font-size: 20px;
+                                    font-weight: 600;
                                     color: Theme.text;
-                                    accessible-label: "Your invite link";
+                                    accessible-label: "Your pairing code";
                                 }
                             }
-                            PillButton {
-                                text: root.copied ? "Copied" : "Copy";
-                                icon: root.copied ? Icons.check : "";
-                                clicked => {
-                                    link-text.select-all();
-                                    link-text.copy();
-                                    root.copied = true;
+                            VerticalLayout {
+                                alignment: center;
+                                PillButton {
+                                    text: root.copied ? "Copied" : "Copy";
+                                    icon: root.copied ? Icons.check : "";
+                                    clicked => {
+                                        code-text.select-all();
+                                        code-text.copy();
+                                        root.copied = true;
+                                    }
                                 }
                             }
                         }
@@ -880,19 +884,19 @@ slint::slint! {
                         VerticalLayout {
                             alignment: center;
                             spacing: 2px;
-                            Text { text: "Join with link"; font-size: 15px; font-weight: 700; color: Theme.text; }
-                            Text { text: "Pairs with the device that created the link."; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+                            Text { text: "Join with code"; font-size: 15px; font-weight: 700; color: Theme.text; }
+                            Text { text: "Type the code the other device shows."; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
                         }
                     }
-                    join-link := Field { placeholder: "Invite link"; label: "Invite link"; }
+                    join-code := Field { placeholder: "Code, like 48213-otter-violin"; label: "Pairing code"; }
                     HorizontalLayout {
                         spacing: 8px;
-                        join-name := Field { placeholder: "Device name"; label: "Name for the inviting device"; }
+                        join-name := Field { placeholder: "Device name"; label: "Name for the other device"; }
                         PillButton {
                             text: root.busy ? "Joining…" : "Join";
                             primary: true;
-                            enabled: !root.busy && join-link.text != "" && join-name.text != "";
-                            clicked => { root.join(join-link.text, join-name.text); }
+                            enabled: !root.busy && join-code.text != "" && join-name.text != "";
+                            clicked => { root.join(join-code.text, join-name.text); }
                         }
                     }
                 }
@@ -1072,7 +1076,7 @@ struct Gui {
     phone: Mutex<Option<crate::phone::Share>>,       // the phone page's server, while that page is open
     saved: Mutex<Vec<PathBuf>>,                      // what the last "Received" card's buttons open
     dropped: Mutex<Vec<PathBuf>>,                    // dragged onto the window, waiting for a device (or offered to the phone)
-    inviting: Mutex<Option<tokio::task::AbortHandle>>, // the invite link that's waiting, so a new one can replace it
+    inviting: Mutex<Option<tokio::task::AbortHandle>>, // the pairing code that's waiting, so a new one can replace it
 }
 
 impl Gui {
@@ -1495,36 +1499,36 @@ fn open(items: Vec<PathBuf>, hidden: bool, phone: bool) -> Result<()> {
     win.on_invite(move |name| {
         g.update(|w| {
             w.set_pair_error("".into());
-            w.set_link("".into());
+            w.set_code("".into());
         });
         let task = tokio::spawn({
             let g = g.clone();
             async move {
                 let name = name.trim().to_string();
-                let (link, joined) = match crate::invite(&name).await {
+                let (code, joined) = match crate::invite(&name).await {
                     Ok(started) => started,
                     Err(e) => return g.update(move |w| w.set_pair_error(format!("{e:#}").into())),
                 };
                 g.update(move |w| {
                     w.set_copied(false);
-                    w.set_link(link.into());
+                    w.set_code(code.into());
                 });
                 let res = joined.await;
-                g.update(|w| w.set_link("".into()));
+                g.update(|w| w.set_code("".into()));
                 match res {
                     Ok(()) => paired(&g, &name),
                     Err(e) => g.update(move |w| w.set_pair_error(format!("{e:#}").into())),
                 }
             }
         });
-        // A new link replaces one nobody has used, say after a typo in the name.
+        // A new code replaces one nobody has used, say after a typo in the name.
         if let Some(old) = g.inviting.lock().expect("not poisoned").replace(task.abort_handle()) {
             old.abort();
         }
     });
 
     let g = gui.clone();
-    win.on_join(move |link, name| {
+    win.on_join(move |code, name| {
         let g = g.clone();
         g.update(|w| {
             w.set_pair_error("".into());
@@ -1532,7 +1536,7 @@ fn open(items: Vec<PathBuf>, hidden: bool, phone: bool) -> Result<()> {
         });
         tokio::spawn(async move {
             let name = name.trim().to_string();
-            let res = crate::join(&link, &name).await;
+            let res = crate::join(&code, &name).await;
             g.update(|w| w.set_busy(false));
             match res {
                 Ok(()) => paired(&g, &name),

@@ -4,13 +4,13 @@
 
 Send files to your own devices and your friends, peer to peer. No IP addresses to type, no accounts, and your files never sit on a server.
 
-Pair once with an invite link, then toss files by name from any network. Run `toss` to open the window: drag files onto it (or click **Toss**) and pick a device. Closing the window keeps toss receiving from the tray. Right-click the tray icon to start toss at login, use it with Claude Code and, on Windows, add it to Explorer's **Send to** menu. (On GNOME the tray needs the AppIndicator extension.)
+Pair once with a short code, then toss files by name from any network. Run `toss` to open the window: drag files onto it (or click **Toss**) and pick a device. Closing the window keeps toss receiving from the tray. Right-click the tray icon to start toss at login, use it with Claude Code and, on Windows, add it to Explorer's **Send to** menu. (On GNOME the tray needs the AppIndicator extension.)
 
 The same from the command line:
 
 ```
-toss invite laptop                  # prints a link; send it to the other device
-toss join toss:7de0…/1eab… desktop  # on the other device
+toss invite laptop                     # prints a code like 48213-otter-violin
+toss join 48213-otter-violin desktop   # on the other device
 toss send laptop report.pdf photos/ # files and folders
 toss listen                         # receive (keep it running)
 ```
@@ -53,7 +53,7 @@ To show less:
 
 - **Run your own relay** ([below](#use-your-own-relay)) and toss never contacts n0. Without one, even devices on the same Wi-Fi use n0 to find each other.
 - **A removed device still knows your device ID**, so it can see when you're online. Delete the `key` file in toss's config folder for a new identity, then pair again.
-- **An invite link works like a ticket**: whoever uses it first is paired. Send links over a channel you trust.
+- **A pairing code works like a ticket**: whoever uses it first is paired, and a wrong guess uses it up. Give it only to the person you mean, by voice or a channel you trust.
 - **macOS and Linux** don't mark received files as downloaded, so the window offers Show in folder there, not Open.
 
 ## Install
@@ -107,12 +107,12 @@ WantedBy=multi-user.target
 ## How it works
 
 - Built on [iroh](https://iroh.computer): a device is its public key. Connections go straight through NATs when they can, otherwise through an encrypted relay.
-- Every connection opens with a signature over its own TLS keys, so a contact can't be faked or replayed. Invite links hold a throwaway key and a 128-bit secret.
+- Every connection opens with a signature over its own TLS keys, so a contact can't be faked or replayed. Pairing codes are short: the number says where the two devices meet, and the two words are checked with SPAKE2, a password-authenticated key exchange, so someone listening learns nothing and a guess has one chance in 65,536.
 - Received files can't land outside Downloads, never overwrite anything (`name (1).ext`), get names that work on every OS, and on Windows carry the "downloaded from the internet" mark. Strangers are turned away, and free space is checked first.
 - Big files stream in 256 KB pieces, so memory stays around 10 MB however large they are. A broken transfer resumes when you send the same files again, after both sides compare a BLAKE3 hash of what already arrived. Partials wait in `Downloads/.toss-incoming`; delete abandoned ones by hand.
 
 ## Not yet
 
-Nearby discovery, a check code after pairing, the macOS download flag, drag and drop on Wayland.
+Nearby discovery, the macOS download flag, drag and drop on Wayland.
 
 MIT licensed. Display font: [Bricolage Grotesque](https://github.com/ateliertriay/bricolage) (SIL Open Font License, `assets/OFL-BricolageGrotesque.txt`).

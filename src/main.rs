@@ -1,6 +1,7 @@
 //! toss: send files to your own devices and friends, peer to peer.
 //! Devices are known by public key (iroh), never by IP address.
 
+mod code;
 mod gui;
 mod mcp;
 mod phone;
@@ -15,6 +16,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use code::Code;
 use icu_normalizer::ComposingNormalizerBorrowed;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey, Signature,
@@ -26,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt
 // v2 adds resuming, v3 checks who's calling before reading their file list. The version is in the
 // protocol name so mismatched builds fail cleanly.
 const ALPN: &[u8] = b"toss/3";
-const INVITE_ALPN: &[u8] = b"toss/invite/1";
+const PAIR_ALPN: &[u8] = b"toss/pair/1"; // pairing by code: SPAKE2, then each side's hello with a proof
 const DIALER: &[u8] = b"dialer";
 const ACCEPTOR: &[u8] = b"acceptor";
 const MAX_MSG: usize = 16 << 20; // a file list
@@ -39,8 +41,8 @@ const NO_SPACE: u8 = 2;
 const USAGE: &str = "usage:
   toss                        open the window
   toss <path>...              open the window with these waiting for a device
-  toss invite <name>          print an invite link (<name> is what you'll call them)
-  toss join <link> <name>     accept an invite link (<name> is what you'll call them)
+  toss invite <name>          print a pairing code (<name> is what you'll call them)
+  toss join <code> <name>     pair using the code the other device shows (<name> is what you'll call them)
   toss contacts               list contacts
   toss forget <name>          remove a contact
   toss send <name> <path>...  send files or folders to a contact
@@ -191,79 +193,106 @@ struct Contact {
 }
 type Contacts = BTreeMap<String, Contact>;
 
-/// First message on every connection: who I am, proven by signing this connection's TLS keys. A join
-/// adds the invite secret; a send follows it with the file list, which is read only once we know them.
+/// First message on every connection: who I am, proven by signing this connection's TLS keys. When
+/// pairing it adds a proof of the code; a send follows it with the file list, read only once we know them.
 #[derive(Serialize, Deserialize)]
 struct Hello {
     from: String,
     sig: Vec<u8>,
     #[serde(default)]
-    secret: Vec<u8>,
+    secret: Vec<u8>, // the proof of the pairing code
 }
 
 async fn cli_invite(name: &str) -> Result<()> {
-    let (link, joined) = invite(name).await?;
-    println!("Send this to {name}. It works once, while this command runs:\n\n  toss join {link} <name for you>\n");
-    println!("Waiting for {name} to join...");
+    let (code, joined) = invite(name).await?;
+    println!("On {name}, open toss, then Add device and Join with code. Or run:\n\n  toss join {code} <name for you>\n");
+    println!("The code works once, while this command runs. Waiting for {name} to join...");
     joined.await?;
     println!("Paired with {name}.");
     Ok(())
 }
 
-/// Returns the link to share, and a future that finishes once they've joined.
+/// Returns the pairing code to share, and a future that finishes once they've joined.
 async fn invite(name: &str) -> Result<(String, impl Future<Output = Result<()>> + Send + 'static)> {
     let home = home()?;
     let me = load_key(&home)?;
     ensure!(!load_contacts(&home)?.contains_key(name), "you already have a contact called {name}");
-    // A throwaway key, so a leaked link never reveals your real device id.
-    let ep = bind(SecretKey::generate(), &[INVITE_ALPN]).await?;
+    let code = Code::generate();
+    let ep = bind(code.meeting(), &[PAIR_ALPN]).await?; // where the other device, working it out from the code, dials
     online(&ep).await?;
-    let secret = SecretKey::generate().to_bytes()[..16].to_vec(); // 16 bytes from the OS random generator
-    let link = format!("toss:{}/{}", ep.id(), hex(&secret));
-    let name = name.to_string();
+    let (shown, name) = (code.to_string(), name.to_string());
     let joined = async move {
         while let Some(incoming) = ep.accept().await {
-            // Relays and the lookup server see the throwaway id, so only the secret proves it's really them.
-            match tokio::time::timeout(Duration::from_secs(30), accept_join(incoming, &me, &secret)).await {
-                Ok(Ok(peer)) => {
+            let tried = tokio::time::timeout(Duration::from_secs(30), async { accept_code(incoming.await?, &me, &code).await }).await;
+            match tried {
+                Ok(Ok(Some(peer))) => {
                     add_contact(&home, &name, peer)?;
                     ep.close().await;
                     return Ok(());
                 }
+                // One try only, so a guess has 1 chance in 65,536.
+                Ok(Ok(None)) => {
+                    ep.close().await;
+                    bail!("someone tried a code that didn't match, so this one is used up. Make a new one");
+                }
+                // Gone before proving anything, so nothing was guessed: keep waiting.
                 Ok(Err(e)) => eprintln!("Rejected a join attempt: {e:#}"),
                 Err(_) => eprintln!("Rejected a join attempt: timed out"),
             }
         }
         bail!("stopped before anyone joined")
     };
-    Ok((link, joined))
+    Ok((shown, joined))
 }
 
-async fn accept_join(incoming: Incoming, me: &SecretKey, secret: &[u8]) -> Result<EndpointId> {
-    let conn = incoming.await?;
+/// The inviting side of pairing by code: their real id once they've proven the code, None when they couldn't.
+async fn accept_code(conn: Connection, me: &SecretKey, code: &Code) -> Result<Option<EndpointId>> {
     let (mut tx, mut rx) = conn.accept_bi().await?;
+    let (pake, ours) = code.pake(false);
+    let theirs: Vec<u8> = recv_msg(&mut rx, MAX_HELLO).await?;
+    send_msg(&mut tx, &ours).await?;
+    let Ok(key) = pake.finish(&theirs) else { return Ok(None) };
+    // They prove the code first; ours goes only to someone who has it.
     let h: Hello = recv_msg(&mut rx, MAX_HELLO).await?;
-    ensure!(same(&h.secret, secret), "wrong invite secret");
+    if !same(&h.secret, &code::proof(&key, &conn, DIALER, &h.from)?) {
+        return Ok(None);
+    }
     let peer = verify(&conn, &h, DIALER)?;
-    send_msg(&mut tx, &introduce(&conn, me, ACCEPTOR)?).await?;
+    let hello = introduce(&conn, me, ACCEPTOR)?;
+    let secret = code::proof(&key, &conn, ACCEPTOR, &hello.from)?;
+    send_msg(&mut tx, &Hello { secret, ..hello }).await?;
     tx.finish()?;
     let _ = tokio::time::timeout(Duration::from_secs(10), conn.closed()).await; // let them read the reply
-    Ok(peer)
+    Ok(Some(peer))
 }
 
-async fn join(link: &str, name: &str) -> Result<()> {
+/// The joining side: the inviting device's real id, once each side has proven it has the code.
+async fn dial_code(conn: &Connection, me: &SecretKey, code: &Code) -> Result<EndpointId> {
+    const WRONG: &str = "that code doesn't match. Check it, or make a new one on the other device";
+    let (mut tx, mut rx) = conn.open_bi().await?;
+    let (pake, ours) = code.pake(true);
+    send_msg(&mut tx, &ours).await?;
+    let theirs: Vec<u8> = recv_msg(&mut rx, MAX_HELLO).await?;
+    let key = pake.finish(&theirs).map_err(|_| anyhow!(WRONG))?;
+    let hello = introduce(conn, me, DIALER)?;
+    let secret = code::proof(&key, conn, DIALER, &hello.from)?;
+    send_msg(&mut tx, &Hello { secret, ..hello }).await?;
+    let h: Hello = recv_msg(&mut rx, MAX_HELLO).await.map_err(|_| anyhow!(WRONG))?; // they hang up on a wrong code
+    ensure!(same(&h.secret, &code::proof(&key, conn, ACCEPTOR, &h.from)?), WRONG);
+    verify(conn, &h, ACCEPTOR)
+}
+
+async fn join(code: &str, name: &str) -> Result<()> {
     let home = home()?;
     let me = load_key(&home)?;
     ensure!(!load_contacts(&home)?.contains_key(name), "you already have a contact called {name}");
-    let (id, secret) = parse_link(link)?;
+    let code = Code::parse(code)?;
     let ep = bind(SecretKey::generate(), &[]).await?;
     let conn = ep
-        .connect(reach(&ep, id).await?, INVITE_ALPN)
+        .connect(reach(&ep, code.meeting().public()).await?, PAIR_ALPN)
         .await
-        .context("couldn't reach the inviter. Is their `toss invite` still running?")?;
-    let (mut tx, mut rx) = conn.open_bi().await?;
-    send_msg(&mut tx, &Hello { secret, ..introduce(&conn, &me, DIALER)? }).await?;
-    let peer = verify(&conn, &recv_msg(&mut rx, MAX_HELLO).await?, ACCEPTOR)?;
+        .context("couldn't reach the other device. Does it still show this code?")?;
+    let peer = dial_code(&conn, &me, &code).await?;
     add_contact(&home, name, peer)?;
     ep.close().await;
     Ok(())
@@ -1011,29 +1040,12 @@ fn add_contact(home: &Path, name: &str, peer: EndpointId) -> Result<()> {
     })
 }
 
-/// Accepts the bare link or the whole "toss join toss:… <name>" line someone pasted.
-fn parse_link(link: &str) -> Result<(EndpointId, Vec<u8>)> {
-    let (id, secret) = link
-        .split_whitespace()
-        .find_map(|word| word.strip_prefix("toss:"))
-        .and_then(|s| s.split_once('/'))
-        .context("not a toss invite link")?;
-    Ok((id.parse()?, unhex(secret).context("not a toss invite link")?))
-}
-
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |diff, (x, y)| diff | (x ^ y)) == 0 // constant time
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
 fn downloads_dir() -> Result<PathBuf> {
@@ -1262,13 +1274,43 @@ mod tests {
         assert_eq!([human(12_000), human(512_000_000), human(12_400_000_000)], ["12 KB", "512.0 MB", "12.4 GB"]);
     }
 
-    #[test]
-    fn invite_link_roundtrip() {
-        let id = SecretKey::generate().public();
-        let (got_id, got_secret) = parse_link(&format!(" toss:{id}/{} ", hex(&[7; 16]))).unwrap();
-        assert_eq!((got_id, got_secret), (id, vec![7; 16]));
-        let pasted = format!("toss join toss:{id}/{} <name for you>", hex(&[7; 16]));
-        assert_eq!(parse_link(&pasted).unwrap().0, id);
-        assert!(parse_link("toss:nope").is_err());
+    #[tokio::test]
+    async fn pairing_takes_the_same_code_on_both_sides() {
+        let (inviter, joiner) = (SecretKey::generate(), SecretKey::generate());
+        let code = Code::parse("04821-otter-violin").unwrap();
+        let invite = |accepted: Connection| {
+            let (inviter, code) = (inviter.clone(), code.clone());
+            tokio::spawn(async move { accept_code(accepted, &inviter, &code).await })
+        };
+
+        let (dialed, accepted, _c1, _s1) = connected_pair().await;
+        let inviting = invite(accepted);
+        assert_eq!(dial_code(&dialed, &joiner, &code).await.unwrap(), inviter.public(), "the joiner learns the inviter's real id");
+        dialed.close(VarInt::from_u32(0), b"done");
+        assert_eq!(inviting.await.unwrap().unwrap(), Some(joiner.public()), "and the inviter the joiner's");
+
+        let (dialed, accepted, _c2, _s2) = connected_pair().await;
+        let inviting = invite(accepted);
+        let wrong = Code::parse("04821-otter-wagon").unwrap(); // the same meeting number, one word off
+        let refused = dial_code(&dialed, &joiner, &wrong).await.unwrap_err();
+        assert!(refused.to_string().contains("doesn't match"), "{refused:#}");
+        assert_eq!(inviting.await.unwrap().unwrap(), None, "a wrong code uses the invite up");
+
+        // Someone squatting the meeting address without the words, who answers without checking anything.
+        let (dialed, accepted, _c3, _s3) = connected_pair().await;
+        let squatter = SecretKey::generate();
+        tokio::spawn(async move {
+            let (mut tx, mut rx) = accepted.accept_bi().await?;
+            let (pake, ours) = wrong.pake(false);
+            let theirs: Vec<u8> = recv_msg(&mut rx, MAX_HELLO).await?;
+            send_msg(&mut tx, &ours).await?;
+            let key = pake.finish(&theirs).map_err(|e| anyhow!("{e:?}"))?;
+            let _: Hello = recv_msg(&mut rx, MAX_HELLO).await?;
+            let hello = introduce(&accepted, &squatter, ACCEPTOR)?;
+            send_msg(&mut tx, &Hello { secret: code::proof(&key, &accepted, ACCEPTOR, &hello.from)?, ..hello }).await?;
+            anyhow::Ok(accepted.closed().await)
+        });
+        let refused = dial_code(&dialed, &joiner, &code).await.unwrap_err();
+        assert!(refused.to_string().contains("doesn't match"), "a squatter's answer is refused: {refused:#}");
     }
 }
