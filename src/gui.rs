@@ -1005,6 +1005,8 @@ slint::slint! {
         in property <bool> claude-found; // Claude Code is installed
         in property <bool> in-claude; // and it runs toss
         in property <[string]> folders; // assistants send from these without asking: the user said "don't ask again"
+        in property <string> update; // a newer toss to install, "" when there's none
+        callback install-update();
         callback open();
         callback toggle-autostart();
         callback toggle-explorer();
@@ -1015,6 +1017,7 @@ slint::slint! {
         // Slint's tray menus don't draw check marks (checked), so the title carries one.
         Menu {
             MenuItem { title: "Open toss"; activated => { root.open(); } }
+            if root.update != "": MenuItem { title: "Update to " + root.update; activated => { root.install-update(); } }
             MenuItem { title: (root.autostart ? "✓ " : "") + "Start at login"; activated => { root.toggle-autostart(); } }
             if root.windows: MenuItem { title: (root.explorer ? "✓ " : "") + "In Explorer's Send to menu"; activated => { root.toggle-explorer(); } }
             if root.claude-found: MenuItem { title: (root.in-claude ? "✓ " : "") + "Use with Claude Code"; activated => { root.toggle-claude(); } }
@@ -1682,6 +1685,37 @@ fn open(items: Vec<PathBuf>, hidden: bool, phone: bool) -> Result<()> {
         }
         seen = now;
     });
+    // A newer toss shows in the tray menu: checked at start, then daily.
+    let t = tray.as_weak();
+    tokio::spawn(async move {
+        loop {
+            if let Ok(Some(version)) = crate::update::newer().await {
+                let _ = t.upgrade_in_event_loop(move |t| t.set_update(version.into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
+    let t = tray.as_weak();
+    tray.on_install_update(move || {
+        let Some(version) = t.upgrade().map(|t| t.get_update().to_string()) else { return };
+        let Some(asset) = crate::update::asset() else {
+            let _ = open_file(Path::new(&format!("{}/latest", crate::update::RELEASES))); // no self-update here: the release page
+            return;
+        };
+        tokio::spawn(async move {
+            match crate::update::download(&version, asset).await.and_then(|build| crate::update::install(&build)) {
+                // On Windows the new toss asks this one to quit; on a Mac it waits for this one to.
+                Ok(()) => {
+                    if cfg!(target_os = "macos") {
+                        let _ = slint::invoke_from_event_loop(|| drop(slint::quit_event_loop()));
+                    }
+                }
+                Err(e) => {
+                    let _ = slint::invoke_from_event_loop(move || alert(&format!("Couldn't update toss: {e:#}")));
+                }
+            }
+        });
+    });
     tray.on_quit(|| {
         let _ = slint::quit_event_loop();
     });
@@ -1973,8 +2007,36 @@ fn install() -> Result<()> {
         }
     }
     let dir = dirs::data_local_dir().context("no local AppData folder")?.join(r"Programs\toss");
-    no_console(Command::new(install_copy(&std::env::current_exe()?, &dir)?).arg("--installed")).spawn()?;
+    let first = !dir.join("toss.exe").exists();
+    let mut installed = Command::new(install_copy(&std::env::current_exe()?, &dir)?);
+    if first {
+        installed.arg("--installed"); // the Start menu, starting at login and Claude Code, on the first install only
+    }
+    no_console(&mut installed).spawn()?;
     Ok(())
+}
+
+/// `toss --install`: an update toss downloaded itself takes the installed copy's place.
+#[cfg(windows)]
+pub fn run_install() -> Result<()> {
+    hide_console();
+    install()
+}
+
+/// `toss --updated`: the first start of an update the toss before it put in place, once that one quits.
+#[cfg(target_os = "macos")]
+pub fn run_updated() -> Result<()> {
+    let home = crate::home()?;
+    for _ in 0..100 {
+        if crate::lock_listener(&home).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if let Some(app) = crate::update::bundle() {
+        let _ = std::fs::remove_dir_all(app.with_extension("old")); // the version it replaced
+    }
+    open(vec![], false, false)
 }
 
 /// Puts a copy of `from` in `dir` as toss.exe. A toss.exe that still runs can't be overwritten, but it
@@ -2001,7 +2063,7 @@ fn start_menu() -> Result<PathBuf> {
 }
 
 /// Starts a console program from the window without a console flashing up (on Windows).
-fn no_console(cmd: &mut Command) -> &mut Command {
+pub fn no_console(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(cmd, 0x0800_0000); // CREATE_NO_WINDOW
     cmd

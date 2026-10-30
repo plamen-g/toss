@@ -14,9 +14,12 @@ icu_normalizer = "2" # already in the build through iroh; compares file names li
 # (X25519 + ML-KEM-768) that rustls prefers below. Port mapping stays out: toss never used it.
 iroh = { version = "1.4.1", default-features = false, features = ["tls-aws-lc-rs", "fast-apple-datapath"] }
 qrcodegen = "1.8"
+# Updates from GitHub releases. Both already come with iroh, built the same way.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+sha2 = "0.11"
 rfd = "0.17.2"
 rmcp = { version = "3.8", features = ["transport-io", "schemars", "elicitation"] } # the official MCP SDK, for `toss mcp`
-rustls = { version = "0.23", default-features = false, features = ["prefer-post-quantum"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Software renderer only: the GPU renderers cost 50-150 MB of RAM for a window this simple.

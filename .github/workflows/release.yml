@@ -64,7 +64,30 @@ jobs:
           done
           lipo -create -output dl/toss dl/arm64/toss dl/x86_64/toss
           sh macos/bundle.sh dl/toss dist
-          gh release upload "$GITHUB_REF_NAME" dist/toss-macos.dmg --clobber
+          ditto -c -k --keepParent dist/toss.app dist/toss-macos.zip # what toss's own updates download
+          gh release upload "$GITHUB_REF_NAME" dist/toss-macos.dmg dist/toss-macos.zip --clobber
+
+  # The checksums of every download, signed, so toss's updates can check what they install. The key is the
+  # TOSS_RELEASE_KEY secret (a PEM file); its public half is in src/update.rs.
+  sign:
+    needs: [build, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - name: sign
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_KEY: ${{ secrets.TOSS_RELEASE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_KEY" || { echo "the TOSS_RELEASE_KEY secret isn't set, and toss won't install unsigned updates"; exit 1; }
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'toss-*' --dir dl
+          cd dl
+          sha256sum toss-* > SHA256SUMS
+          umask 077 # the key file: readable by this job only, and gone with the runner
+          printf '%s\n' "$RELEASE_KEY" > "$RUNNER_TEMP/release-key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/release-key.pem" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm "$RUNNER_TEMP/release-key.pem"
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" SHA256SUMS SHA256SUMS.sig --clobber
 
   # mcpb's check of the bundle's manifest. Its npm dependencies aren't pinned, so it runs here, where it
   # can't touch the release or publish, and never where the bundle is made.

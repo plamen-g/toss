@@ -5,6 +5,7 @@ mod code;
 mod gui;
 mod mcp;
 mod phone;
+mod update;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -63,6 +64,10 @@ async fn main() {
         [] => gui::run(vec![], false),
         ["--tray"] => gui::run(vec![], true), // started at login
         ["--installed"] => gui::run_installed(), // the first start after installing itself
+        #[cfg(windows)]
+        ["--install"] => gui::run_install(), // an update toss downloaded: take the installed copy's place
+        #[cfg(target_os = "macos")]
+        ["--updated"] => gui::run_updated(), // the first start of an update, once the toss before it quits
         ["--phone", files @ ..] => gui::run_phone(files.iter().map(PathBuf::from).collect()), // from `toss mcp`
         ["ask"] => gui::ask(), // toss's own question, for `toss mcp`
         ["invite", name] => cli_invite(name).await,

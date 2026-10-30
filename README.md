@@ -48,6 +48,7 @@ Transfers are encrypted end to end (QUIC with TLS 1.3 and a post-quantum X25519 
 | n0, whose free servers toss uses by default to connect devices | Your IP and device ID, which devices connect and when, and the volume through its relay |
 | Your internet provider or Wi-Fi | Encrypted traffic and its size |
 | Anyone intercepting your Wi-Fi, for the phone page | The files: that page isn't encrypted |
+| GitHub, where toss checks for updates (at start and once a day) | Your IP and toss's version |
 
 To show less:
 
@@ -63,6 +64,8 @@ To show less:
 **Mac:** download [toss-macos.dmg](https://github.com/plamen-g/toss/releases/latest/download/toss-macos.dmg) (any Mac), open it and drag toss onto Applications. It isn't signed by Apple yet, so the first time macOS won't open it: go to System Settings → Privacy & Security and click Open Anyway. In the terminal it's `/Applications/toss.app/Contents/MacOS/toss`.
 
 **Linux:** put `toss` from [Releases](https://github.com/plamen-g/toss/releases) on your PATH.
+
+When a new version is out, the tray menu offers **Update to** it. On Windows and Mac toss downloads it, checks its signature against toss's release key, and restarts as the new version; on Linux it opens the release page.
 
 To build it: `cargo build --release` (about 14 MB). On a Mac, `sh macos/bundle.sh` then makes `target/release/toss.app` and `toss-macos.dmg`.
 
